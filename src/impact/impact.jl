@@ -15,9 +15,12 @@ include("aula_solver.jl")
 const ImpactOptions = AulaConfig
 const ImpactResult = AulaResult
 
-function solve(model::MPCCModels.AbstractMPCCModel;
+function solve(mpcc::MPCCModels.AbstractMPCCModel;
                options::ImpactOptions=ImpactOptions())
-    sub = buildMPCC(model, options)
-    x0 = model.nlp.meta.x0
-    return solve!(AulaSolver(), sub, options, x0)
+    vertical = MPCCModels.is_vertical(mpcc)
+    if !vertical
+        mpcc = MPCCModels.vertical_form(mpcc)
+    end
+    x0 = if vertical; mpcc.nlp.meta.x0 else mpcc.nlp.meta.parent.x0 end
+    return solve!(AulaSolver(), buildMPCC(mpcc, options), options, x0)
 end

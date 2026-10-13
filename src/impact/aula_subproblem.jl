@@ -77,8 +77,10 @@ function _bound_data(lower, upper, atol; complementarity_variables=Set{Int}())
 end
 
 """Build the model adapter and its multiplier blocks from a vertical MPCC."""
-function AulaSubproblem(model::MPCCModels.AbstractMPCCModel, config::AulaConfig)
-    mpcc = MPCCModels.is_vertical(model) ? model : MPCCModels.vertical_form(model)
+function AulaSubproblem(mpcc::MPCCModels.AbstractMPCCModel, config::AulaConfig)
+    if !MPCCModels.is_vertical(mpcc)
+        error("Impact solver currently expects a vertical form MPCC.")
+    end
     x0 = NLPModels.get_x0(mpcc)
     T = eltype(x0)
     nc, nv = NLPModels.get_ncon(mpcc), NLPModels.get_nvar(mpcc)
