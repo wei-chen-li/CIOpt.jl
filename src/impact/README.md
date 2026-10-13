@@ -12,7 +12,6 @@ The main solver components have direct Julia counterparts:
 | `saddle_layout.h` | [`saddle_layout.jl`](saddle_layout.jl) |
 | `complementarity_projection.h` | [`complementarity_projection.jl`](complementarity_projection.jl) |
 | `aula_subproblem.{h,cpp}` | [`aula_subproblem.jl`](aula_subproblem.jl) |
-| `mpcc_subproblem.{h,cpp}` | [`mpcc_subproblem.jl`](mpcc_subproblem.jl) |
 | `gauss_newton_solver.{h,cpp}` | [`gauss_newton_solver.jl`](gauss_newton_solver.jl) |
 | `aula_solver.{h,cpp}` | [`aula_solver.jl`](aula_solver.jl) |
 
