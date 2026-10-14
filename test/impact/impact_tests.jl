@@ -4,7 +4,7 @@ using MPCCModels
 using SparseArrays
 using Test
 
-@testset "solve a simple vertical MPCC" begin
+@testset "solve a simple vertical form MPCC" begin
     objective(x) = (x[1] - 1)^2 + (x[2] - 0.2)^2
     nlp = ADNLPModels.ADNLPModel(
         objective,  # f
@@ -15,10 +15,8 @@ using Test
     mpcc = MPCCModels.MPCCModel(nlp, [1], [2])
     @assert MPCCModels.is_vertical(mpcc)
 
-    result = CIOpt.solve(
-        mpcc;
-        options=CIOpt.ImpactOptions(print_level=0)
-    )
+    solver = CIOpt.ImpactSolver(mpcc; print_level=0)
+    result = CIOpt.solve!(solver)
 
     tol = 1e-4
     @test result.converged
@@ -30,7 +28,7 @@ using Test
     @test result.objective_value ≈ 0.04 atol=tol
 end
 
-@testset "solve a simple non-vertical MPCC" begin
+@testset "solve a simple non-vertical form MPCC" begin
     objective(x) = (x[1] - 1)^2 + (x[2] - 0.2)^2
     nlp = ADNLPModels.ADNLPModel(
         objective,  # f
@@ -42,10 +40,8 @@ end
     mpcc = MPCCModels.MPCCModelConCon(nlp, [1], [2])
     @assert !MPCCModels.is_vertical(mpcc)
 
-    result = CIOpt.solve(
-        mpcc;
-        options=CIOpt.ImpactOptions(print_level=0)
-    )
+    solver = CIOpt.ImpactSolver(mpcc; print_level=0)
+    result = CIOpt.solve!(solver)
 
     tol = 1e-4
     @test result.converged

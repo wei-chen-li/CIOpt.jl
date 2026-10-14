@@ -18,10 +18,12 @@ The main solver components have direct Julia counterparts:
 The Julia solver retains impact's safeguarded multiplier and penalty updates,
 balanced penalty initialization, forcing sequence, stagnation restarts, split
 complementarity slacks, closed-form branch projection, and sparse normal or
-primal-dual saddle X updates. The public entry point is `solve(mpcc)`.
+primal-dual saddle X updates. MPCCModels supplies a general NLP objective and
+its Hessian, while impact's original subproblem uses least-squares residual rows.
+CIOpt therefore forms the same augmented penalty channels and solves the X update
+from the NLP Lagrangian Hessian plus Gauss-Newton penalty curvature.
 
-MPCCModels supplies a general NLP objective and its Hessian, while impact's
-original subproblem uses least-squares residual rows. CIOpt therefore forms the
-same augmented penalty channels and solves the X update from the NLP Lagrangian
-Hessian plus Gauss-Newton penalty curvature. Complementarity remains the exact
-set `0 ≤ G ⟂ H ≥ 0`; there is no product relaxation.
+```julia
+solver = CIOpt.ImpactSolver(mpcc)
+result = CIOpt.solve!(solver)
+```

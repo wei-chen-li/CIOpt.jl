@@ -1,7 +1,7 @@
 using LinearAlgebra
+using MPCCModels
+using NLPModels
 using SparseArrays
-import MPCCModels
-import NLPModels
 
 include("aula_config.jl")
 include("dual_block.jl")
@@ -11,23 +11,35 @@ include("aula_subproblem.jl")
 include("gauss_newton_solver.jl")
 include("aula_solver.jl")
 
-const ImpactOptions = AulaConfig
-const ImpactResult = AulaResult
+export ImpactSolver, solve!
 
 """
-    solve(mpcc::MPCCModels.AbstractMPCCModel; options=ImpactOptions())
+    ImpactSolver(mpcc::MPCCModels.AbstractMPCCModel; kwargs...)
 
-Solve an MPCCModels problem with the impact AuLa algorithm. A general MPCC is
-converted to vertical form first; the resulting NLP objective, derivatives,
-ordinary bounds, and complementarity maps are assembled into solver state. The
-initial primal point comes from the MPCCModels model.
+A non-vertical MPCC is converted to vertical form. `AulaConfig` is setup from
+`kwargs`.
 """
-function solve(mpcc::MPCCModels.AbstractMPCCModel;
-               options::ImpactOptions=ImpactOptions())
-    options = validate(options)
-    vertical = MPCCModels.is_vertical(mpcc)
-    if !vertical; mpcc = MPCCModels.vertical_form(mpcc) end
-    sub = AulaSubproblem(mpcc, options)
-    x0 = if vertical; mpcc.nlp.meta.x0 else mpcc.nlp.meta.parent.x0 end
-    return solve!(AulaSolver(), sub, options, x0)
+mutable struct ImpactSolver{M,T<:AbstractFloat}
+    mpcc::M
+    config::AulaConfig
+    subproblem::AulaSubproblem{M,T}
+    aula_solver::AulaSolver
+end
+
+function ImpactSolver(mpcc::MPCCModels.AbstractMPCCModel; kwargs...)
+    config = validate(AulaConfig(; kwargs...))
+    mpcc = MPCCModels.is_vertical(mpcc) ? mpcc : MPCCModels.vertical_form(mpcc)
+    subproblem = AulaSubproblem(mpcc, config)
+    return ImpactSolver(mpcc, config, subproblem, AulaSolver())
+end
+
+"""
+    solve!(solver::ImpactSolver)
+
+Solve the MPCC stored in `solver`, mutating its AuLa and Gauss-Newton state.
+Returns the `AulaResult` from this solve.
+"""
+function solve!(solver::ImpactSolver)
+    x_init = MPCCModels.get_x0(solver.mpcc)
+    return solve!(solver.aula_solver, solver.subproblem, solver.config, x_init)
 end
