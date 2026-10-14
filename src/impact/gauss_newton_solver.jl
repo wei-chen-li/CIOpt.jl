@@ -1,4 +1,10 @@
-"""Statistics from the most recent damped Gauss-Newton/Newton X update."""
+"""
+State for damped Gauss-Newton/Newton X updates. `iterations` counts accepted
+primal steps and `factor_failures` counts failed sparse factorizations across
+the most recent `minimize!` call. The timing fields accumulate over the current
+outer solve; `solve!` resets them at its start. A transient factorization failure
+only marks `x_update_failed` if that X solve accepted no step.
+"""
 mutable struct GaussNewtonSolver
     iterations::Int
     factor_failures::Int
@@ -8,7 +14,13 @@ mutable struct GaussNewtonSolver
 end
 GaussNewtonSolver() = GaussNewtonSolver(0, 0, false, 0.0, 0.0)
 
-"""X-update controls corresponding to impact's standalone GaussNewtonConfig."""
+"""
+X-update controls for the damped primal solve. `lambda_init` is restored for
+each `minimize!` call; failed or rejected steps raise it, while accepted steps
+lower it according to the gain ratio. The saddle backend avoids explicitly
+forming the penalty normal-equation term; `sigma_primal` adds a small proximal
+diagonal to its primal block.
+"""
 Base.@kwdef struct GaussNewtonConfig
     max_iter::Int = 50
     grad_tol::Float64 = 1e-6
@@ -42,6 +54,15 @@ function _saddle_step(Hlag, C, rhs_penalty, gradient, λ, config::GaussNewtonCon
         end
     end
     S = spdiagm(0 => sdual)
+    # Solve the primal-dual system for the same damped Gauss-Newton step as
+    # (Hlag + C'*C + lambda*I)\dx = -gradient. Since gradient already includes
+    # C'*rhs, define gbase = gradient - C'*rhs and introduce a dual variable:
+    #
+    #   [Hlag+(lambda+sigma)I   C'*S ] [dx] = [-gbase]
+    #   [S*C                   -S^2 ] [ y]   [-S*rhs ]
+    #
+    # Eliminating y recovers the penalty normal equations (with the small sigma
+    # proximal term). The diagonal congruence scale S improves row conditioning.
     M = [sparse(Hlag + (λ + σ) * I) C' * S;
          S * C -spdiagm(0 => sdual .^ 2)]
     b = vcat(-gbase, -sdual .* rhs_penalty)
@@ -74,6 +95,9 @@ function _saddle_step(Hlag, C, rhs_penalty, gradient, λ, config::GaussNewtonCon
 end
 
 function _normal_step(Hlag, C, gradient, λ)
+    # C already includes each active residual's sqrt(2*rho)*scale factor, so
+    # C'*C is the Gauss-Newton penalty curvature and `gradient` is the full
+    # augmented gradient.
     H = sparse(Hlag + C' * C + λ * I)
     F = try
         cholesky(Symmetric(H); check=false)
@@ -89,7 +113,20 @@ function _normal_step(Hlag, C, gradient, λ)
     return all(isfinite, dx) ? dx : nothing
 end
 
-"""Minimize the current AuLa model in-place using damped sparse X updates."""
+"""
+    minimize!(solver, sub, x, config; grad_tol=-1)
+
+Minimize the current augmented objective in-place with damped sparse X steps.
+At each iteration, solve the saddle system or normal equations, evaluate the
+trial point, and accept it only when the objective decreases and the gain ratio
+is positive. Rejections increase the LM damping geometrically; accepted steps
+reduce it. Damping always restarts at `lambda_init` on the next call.
+
+`grad_tol` can override the configured gradient tolerance for one call, which
+lets the AuLa outer loop use an inexact forcing sequence. If a factorization
+fails, backtracking steepest descent is tried after the LM retries; a failed
+factorization is considered terminal only when no step was accepted.
+"""
 function minimize!(solver::GaussNewtonSolver, sub::AulaSubproblem, x::Vector,
                    config::AulaConfig; grad_tol::Real=-1)
     gn = GaussNewtonConfig(config)
@@ -107,6 +144,8 @@ function minimize!(solver::GaussNewtonSolver, sub::AulaSubproblem, x::Vector,
         solver.eval_seconds += (time_ns() - t0) / 1e9
         ginf = isempty(g) ? 0.0 : norm(g, Inf)
         ginf < gtol && break
+        # This is the Hessian of the local quadratic model. The full model
+        # objective used below also includes the first-order term `g`.
         model_hess = sparse(Hlag + C' * C)
         accepted = false
         la_failed_this_iter = false
@@ -135,6 +174,8 @@ function minimize!(solver::GaussNewtonSolver, sub::AulaSubproblem, x::Vector,
             φtrial = evaluate_augmented(sub, xtrial)[1]
             solver.eval_seconds += (time_ns() - t_eval) / 1e9
             predicted = -dot(g, dx) - dot(dx, model_hess * dx) / 2
+            # Gain ratio compares actual reduction to the local quadratic
+            # prediction. It controls whether LM damping grows or shrinks.
             gain = predicted > 0 ? (φ - φtrial) / predicted : -1.0
             if isfinite(φtrial) && φtrial < φ && gain > 0
                 x .= xtrial

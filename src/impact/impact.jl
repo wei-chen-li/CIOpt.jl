@@ -14,6 +14,14 @@ include("aula_solver.jl")
 const ImpactOptions = AulaConfig
 const ImpactResult = AulaResult
 
+"""
+    solve(mpcc::MPCCModels.AbstractMPCCModel; options=ImpactOptions())
+
+Solve an MPCCModels problem with the impact AuLa algorithm. A general MPCC is
+converted to vertical form first; the resulting NLP objective, derivatives,
+ordinary bounds, and complementarity maps are assembled into solver state. The
+initial primal point comes from the MPCCModels model.
+"""
 function solve(mpcc::MPCCModels.AbstractMPCCModel;
                options::ImpactOptions=ImpactOptions())
     options = validate(options)

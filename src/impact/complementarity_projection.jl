@@ -3,6 +3,13 @@
 For each pair, compare the minimizers on the two branches `(sG ≥ 0, sH = 0)`
 and `(sG = 0, sH ≥ 0)`. This is the same closed-form BCD update used in
 `impact_solver`; no product relaxation or smoothing is introduced.
+
+For the first branch, the scalar minimizer is
+`sG = max(0, G + kappaG/(rho*scale))`, `sH = 0`. For the second it is
+`sG = 0`, `sH = max(0, H + kappaH/(rho*scale))`. The shifted residuals
+`aG = scale*G + kappaG/rho` and `aH = scale*H + kappaH/rho` give branch costs
+`min(aG,0)^2 + aH^2` and `aG^2 + min(aH,0)^2`; choosing the smaller cost is the
+exact minimizer over the complementarity set for that pair.
 """
 function project_complementarity!(comp::CompBlock, G::AbstractVector, H::AbstractVector)
     length(G) == comp.dim == length(H) || throw(DimensionMismatch("complementarity block size"))

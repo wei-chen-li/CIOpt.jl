@@ -1,4 +1,16 @@
-"""State and model data consumed by the AuLa and damped Gauss-Newton loops."""
+"""
+    AulaSubproblem
+
+Solver state for one finite-dimensional MPCCModels model. The model supplies
+the objective, ordinary NLP constraints and derivatives, plus the vertical
+complementarity maps `G(x)` and `H(x)`. Bounds become equality or one-sided
+inequality `DualBlock`s; complementarity pairs use a separate `CompBlock`
+because their slack update projects onto a disjunctive set.
+
+The solver mutates each block's multipliers, penalties, and complementarity
+slacks across the AuLa outer iterations. It does not need to know how the input
+MPCC was originally transcribed.
+"""
 mutable struct AulaSubproblem{M,T<:AbstractFloat}
     model::M
     nvar::Int
@@ -14,7 +26,13 @@ mutable struct AulaSubproblem{M,T<:AbstractFloat}
     max_stagnation_restarts::Int
 end
 
-"""Current augmented least-squares/Newton data at one primal iterate."""
+"""
+Current augmented model at one primal iterate. `gradient` is the exact gradient
+of the augmented objective; `lagrangian_hessian` contains the model's NLP
+Lagrangian Hessian; `penalty_jacobian` and `penalty_rhs` encode the residual
+curvature used by the Gauss-Newton step. Violation fields are unscaled
+diagnostics.
+"""
 struct AugmentedEvaluation{T<:AbstractFloat}
     value::T
     gradient::Vector{T}
@@ -27,6 +45,10 @@ struct AugmentedEvaluation{T<:AbstractFloat}
 end
 
 function sync_params!(sub::AulaSubproblem{M,T}) where {M,T}
+    # Keep a stable flat snapshot of the mutable AuLa state. Standard blocks
+    # store kappa then rho; complementarity blocks store both multipliers, both
+    # slacks, then rho. Numerical evaluation uses the block fields directly; the
+    # buffer mirrors impact's persistent subproblem parameter layout.
     empty!(sub.parameter_buffer)
     for b in sub.dual_blocks
         append!(sub.parameter_buffer, b.kappa)
@@ -43,6 +65,9 @@ function sync_params!(sub::AulaSubproblem{M,T}) where {M,T}
 end
 
 function eval_block_source(sub::AulaSubproblem, x, b::DualBlock)
+    # Constraint blocks read c(x); variable blocks read x itself. Signs and
+    # offsets turn each finite bound into an equality residual or one that must
+    # be nonpositive.
     source = b.source === :constraint ? NLPModels.cons(sub.model, x) : x
     return b.signs .* source[b.indices] .+ b.offsets
 end
@@ -57,6 +82,9 @@ function block_jacobian(sub::AulaSubproblem, x, b::DualBlock)
 end
 
 function _bound_data(lower, upper, atol; complementarity_variables=Set{Int}())
+    # Collapse coincident finite bounds into one equality. Encode l <= v as
+    # l-v <= 0 and v <= u as v-u <= 0. Lower bounds on complementarity
+    # variables are represented by G(x)>=0 and H(x)>=0, so don't duplicate them.
     T = promote_type(eltype(lower), eltype(upper))
     eq_idx, eq_val = Int[], T[]
     ineq_idx, ineq_sign, ineq_off = Int[], T[], T[]
@@ -76,7 +104,14 @@ function _bound_data(lower, upper, atol; complementarity_variables=Set{Int}())
     return (eq_idx, eq_val), (ineq_idx, ineq_sign, ineq_off)
 end
 
-"""Build the model adapter and its multiplier blocks from a vertical MPCC."""
+"""
+    AulaSubproblem(model, config)
+
+Build AuLa state from a vertical MPCCModels model. Ordinary constraint and
+variable bounds are grouped by equality/inequality type and use the matching
+config scale, penalty seed, and tolerance. Complementarity values and Jacobians
+come from MPCCModels' vertical-form API.
+"""
 function AulaSubproblem(mpcc::MPCCModels.AbstractMPCCModel, config::AulaConfig)
     if !MPCCModels.is_vertical(mpcc)
         error("Impact solver currently expects a vertical form MPCC.")
@@ -129,19 +164,37 @@ function AulaSubproblem(mpcc::MPCCModels.AbstractMPCCModel, config::AulaConfig)
 end
 
 function _append_sparse_row!(I, J, V, rowidx, row, scale)
+    # Append one scaled sparse Jacobian row in triplet form. The caller chooses
+    # rowidx so inactive inequality rows can be omitted and the rest compacted.
     inds, vals = findnz(sparse(vec(row)))
     for k in eachindex(inds)
         push!(I, rowidx); push!(J, inds[k]); push!(V, scale * vals[k])
     end
 end
 
-"""Evaluate objective, exact AL gradient/curvature, and penalty saddle rows."""
+"""
+    evaluate_augmented(sub, x; update_projection=false)
+
+Evaluate the objective plus all shifted AuLa penalty terms at `x`. An equality
+contributes `sqrt(rho)*(scale*h + kappa/rho)`; an inequality contributes the
+positive part of that expression. Each complementarity pair contributes two
+terms, one for `G-sG` and one for `H-sH`. The slacks stay fixed unless
+`update_projection=true`.
+
+The returned sparse matrix `C` and vector `rhs` represent active penalty
+residuals locally as `C*dx + rhs`. The augmented gradient is `grad(f) + C'*rhs`.
+The primal X step uses the model's Lagrangian Hessian plus Gauss-Newton penalty
+curvature `C'*C`.
+"""
 function evaluate_augmented(sub::AulaSubproblem{M,T}, x::AbstractVector;
                             update_projection::Bool=false) where {M,T}
     model = sub.model
     xv = T.(x)
     f = T(NLPModels.obj(model, xv))
     grad = T.(NLPModels.grad(model, xv))
+    # NLPModels.hess expects multipliers for its ordinary constraints. Accumulate
+    # the derivative of each active AuLa constraint term here; variable bounds
+    # are affine and therefore add no second-order contribution.
     ylag = zeros(T, sub.ncon)
     cvals = T.(NLPModels.cons(model, xv))
     Jc = sparse(T.(NLPModels.jac(model, xv)))
@@ -164,11 +217,16 @@ function evaluate_augmented(sub::AulaSubproblem{M,T}, x::AbstractVector;
         for k in eachindex(vals)
             scaled = b.scale * vals[k]
             shifted = scaled + b.kappa[k] / b.rho
+            # Equality rows are always active. An inequality's squared positive
+            # part is locally flat when its shifted residual is nonpositive.
             active = b.kind === :equality || shifted > 0
             value += b.rho * (b.kind === :equality ? shifted^2 : max(shifted, zero(T))^2)
             if !active
                 continue
             end
+            # `q` is the shifted equality multiplier, or the projected
+            # nonnegative inequality multiplier, before applying the residual
+            # scale and the factor 2 from the squared penalty.
             q = b.kind === :equality ? b.kappa[k] + b.rho * scaled : b.rho * shifted
             row = Jb[k, :]
             row_scale = active ? sqrt(2 * b.rho) * b.scale : zero(T)
@@ -190,6 +248,8 @@ function evaluate_augmented(sub::AulaSubproblem{M,T}, x::AbstractVector;
         JG = sparse(T.(MPCCModels.jac_comp_left(model, xv)))
         JH = sparse(T.(MPCCModels.jac_comp_right(model, xv)))
         for comp in sub.comp_blocks
+            # In BCD mode the X step holds these slacks fixed; this keyword lets
+            # callers explicitly refresh the Y/Z projection during evaluation.
             if update_projection
                 project_complementarity!(comp, G, H)
             end
@@ -220,6 +280,8 @@ function evaluate_augmented(sub::AulaSubproblem{M,T}, x::AbstractVector;
 
     C = sparse(rowI, rowJ, rowV, nrows, sub.nvar)
     grad .+= C' * rhs
+    # Ordinary NLP multipliers supply exact constraint curvature. Bound and
+    # complementarity penalty curvature is represented by C'*C above.
     Hlag = sparse(T.(NLPModels.hess(model, xv, ylag)))
     Hlag = sparse((Hlag + Hlag') / 2)
     layout = SaddleLayout(sub.nvar, 0, nrows, blocks)
