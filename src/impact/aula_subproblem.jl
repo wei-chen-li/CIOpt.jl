@@ -73,7 +73,13 @@ function eval_block_source(sub::AulaSubproblem, x, b::DualBlock)
 end
 
 function block_jacobian(sub::AulaSubproblem, x, b::DualBlock)
-    Jsrc = b.source === :constraint ? NLPModels.jac(sub.model, x) : spzeros(eltype(x), 0, length(x))
+    if b.source === :constraint
+        rows, cols = NLPModels.jac_structure(sub.model)
+        vals = NLPModels.jac_coord(sub.model, x)
+        Jsrc = sparse(rows, cols, vals, sub.ncon, sub.nvar)
+    else
+        Jsrc = spzeros(eltype(x), 0, length(x))
+    end
     if b.source === :variable
         return sparse(b.signs .* sparse(1:length(b.indices), b.indices, ones(eltype(x), length(b.indices)),
                                         length(b.indices), sub.nvar))
@@ -113,9 +119,6 @@ config scale, penalty seed, and tolerance. Complementarity values and Jacobians
 come from MPCCModels' vertical-form API.
 """
 function AulaSubproblem(mpcc::MPCCModels.AbstractMPCCModel, config::AulaConfig)
-    if !MPCCModels.is_vertical(mpcc)
-        error("Impact solver currently expects a vertical form MPCC.")
-    end
     x0 = NLPModels.get_x0(mpcc)
     T = eltype(x0)
     nc, nv = NLPModels.get_ncon(mpcc), NLPModels.get_nvar(mpcc)
@@ -192,12 +195,13 @@ function evaluate_augmented(sub::AulaSubproblem{M,T}, x::AbstractVector;
     xv = T.(x)
     f = T(NLPModels.obj(model, xv))
     grad = T.(NLPModels.grad(model, xv))
-    # NLPModels.hess expects multipliers for its ordinary constraints. Accumulate
-    # the derivative of each active AuLa constraint term here; variable bounds
-    # are affine and therefore add no second-order contribution.
+    # Accumulate ordinary-constraint multipliers for the sparse Hessian
+    # coordinates; variable bounds are affine and add no second-order term.
     ylag = zeros(T, sub.ncon)
     cvals = T.(NLPModels.cons(model, xv))
-    Jc = sparse(T.(NLPModels.jac(model, xv)))
+    jac_rows, jac_cols = NLPModels.jac_structure(model)
+    jac_vals = T.(NLPModels.jac_coord(model, xv))
+    Jc = sparse(jac_rows, jac_cols, jac_vals, sub.ncon, sub.nvar)
     blocks = SaddleBlock{T}[]
     rowI, rowJ, rowV = Int[], Int[], T[]
     rhs = T[]
@@ -245,8 +249,14 @@ function evaluate_augmented(sub::AulaSubproblem{M,T}, x::AbstractVector;
     if sub.ncomp > 0
         G = T.(MPCCModels.comp_res_left(model, xv))
         H = T.(MPCCModels.comp_res_right(model, xv))
-        JG = sparse(T.(MPCCModels.jac_comp_left(model, xv)))
-        JH = sparse(T.(MPCCModels.jac_comp_right(model, xv)))
+        # Assemble the complementarity Jacobians from MPCCModels' sparse COO
+        # structure and coordinate APIs, avoiding a dense intermediate matrix.
+        IG, JGcols = MPCCModels.jac_comp_left_structure(model)
+        VG = T.(MPCCModels.jac_comp_left_coord(model, xv))
+        JG = sparse(IG, JGcols, VG, sub.ncomp, sub.nvar)
+        IH, JHcols = MPCCModels.jac_comp_right_structure(model)
+        VH = T.(MPCCModels.jac_comp_right_coord(model, xv))
+        JH = sparse(IH, JHcols, VH, sub.ncomp, sub.nvar)
         for comp in sub.comp_blocks
             # In BCD mode the X step holds these slacks fixed; this keyword lets
             # callers explicitly refresh the Y/Z projection during evaluation.
@@ -282,7 +292,10 @@ function evaluate_augmented(sub::AulaSubproblem{M,T}, x::AbstractVector;
     grad .+= C' * rhs
     # Ordinary NLP multipliers supply exact constraint curvature. Bound and
     # complementarity penalty curvature is represented by C'*C above.
-    Hlag = sparse(T.(NLPModels.hess(model, xv, ylag)))
+    hess_rows, hess_cols = NLPModels.hess_structure(model)
+    hess_vals = T.(NLPModels.hess_coord(model, xv, ylag))
+    Hlag_lower = sparse(hess_rows, hess_cols, hess_vals, sub.nvar, sub.nvar)
+    Hlag = sparse(Symmetric(Hlag_lower, :L))
     Hlag = sparse((Hlag + Hlag') / 2)
     layout = SaddleLayout(sub.nvar, 0, nrows, blocks)
     return value, grad, Hlag, C, rhs, layout, violations, comp_product, comp_split
