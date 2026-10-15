@@ -9,8 +9,11 @@ MPCCModels = "cbaba3ef-cedb-4e5a-9903-71bbac24a74a"
 NLPModels = "a4795742-8479-5a88-8948-cc11e1c8c1a6"
 SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 
+[sources]
+MPCCModels = {rev = "master", url = "https://github.com/wei-chen-li/MPCCModels.jl"}
+
 [compat]
-MPCCModels = "0.1"
+MPCCModels = "0.2.0"
 NLPModels = "0.21"
 julia = "1.10"
 
