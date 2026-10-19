@@ -1,141 +1,149 @@
 """
     AulaConfig(; kwargs...)
 
-Controls the safeguarded augmented-Lagrangian (AuLa) outer loop and its inner
-block-coordinate-descent (BCD) solve. Each outer iteration updates the dual
-multipliers and penalties. Each inner sweep alternates a damped primal X step
-with an exact projection of the complementarity slacks.
+Configuration used by the augmented-Lagrangian solver.
 
-The `*_scale` fields condition residuals; `rho_*_init` fields seed their
-penalties; and the outer tolerances are applied to unscaled feasibility
-residuals (except when `conditioned_complementarity` is enabled). With a direct
-`MPCCModels` input, ordinary equality and inequality bounds form shared blocks.
-There is no separately identified dynamics block, so `dynamics_scale` and
-`rho_dynamics_init` are retained for config compatibility but are not used by
-this model adapter.
+The inner loop is block-coordinate descent: the complementarity slacks are frozen
+at their closed-form projection while the trajectory variables take a
+Gauss-Newton step, both inside the AuLa outer loop.
 """
 Base.@kwdef struct AulaConfig
-    # Initial penalty for each kind of residual block. Penalties grow by
-    # rho_scale, subject to rho_max, only when safeguarded progress is too small.
-    rho_fix_point_init::Float64 = 1
-    rho_dynamics_init::Float64 = 1
+    # Initial AuLa penalties, grouped by constraint type.
     rho_eq_init::Float64 = 1
     rho_ineq_init::Float64 = 1
     rho_comp_init::Float64 = 1
-    # rho_scale is gamma in the geometric increase; rho_max is its nominal cap.
-    # eta=penalty_decrease_ratio prevents an increase once v_new <= eta*v_old.
-    rho_max::Float64 = 1e6
-    rho_scale::Float64 = 1.1
-    penalty_decrease_ratio::Float64 = 0.5
 
-    # Optional balanced initialization (off by default). For a block with an
-    # informative initial residual c, choose effective stiffness
-    # rho_eff = rho*scale^2 = clamp(2*max(1,abs(f(x0)))/||c||^2, clip_min, clip_max).
-    # Inequality c contains only its violating part; complementarity c is the
-    # distance to the union of its two feasible branches. A block starting with
-    # ||c||^2 <= 1 keeps its configured seed until a later outer iterate gives
-    # it a measurable residual. The effective units make the initialization
-    # independent of both objective units and residual conditioning scales.
+    # Penalty schedule
+    rho_max::Float64 = 1e6                 # Penalty cap
+    rho_scale::Float64 = 1.1               # Penalty increase factor gamma > 1
+    penalty_decrease_ratio::Float64 = 0.5  # Safeguard ratio eta in [0,1]
+
+    # Balanced initial penalties (Birgin & Martinez, Practical Augmented Lagrangian
+    # Methods, sec. 12.1). When on, the rho_*_init seeds above are ignored and each
+    # dual block's initial EFFECTIVE penalty rho_eff = rho * scale^2 is computed at
+    # z_init as
+    #
+    #     rho_eff = clip(2 max(1, |f(z0)|) / ||c(z0)||^2, clip_min, clip_max)
+    #
+    # with c the block's UNSCALED residual (violating part only for inequalities;
+    # distance to the complementarity set for comp blocks). A block whose initial
+    # residual is below 1 carries no scale information; it keeps its build-time
+    # rho_*_init seed -- the only prior there is -- and is balanced at the first
+    # outer iteration that hands it a measurable residual. Working in effective units makes the
+    # whole scheme invariant under both the objective's scaling and the per-type
+    # conditioning scales -- a nominal-rho window under-enforces any block with
+    # scale << 1 (rho_max * scale^2 can sit orders below every other channel),
+    # which is what produced mode-averaged chattering plans at small comp_scale.
+    # In auto mode the safeguarded growth cap is per-block for the same reason:
+    # max(rho_max, clip_max / scale^2). The safeguarded update still grows rho,
+    # so this changes where the penalty path starts, never where it can end.
+    #
+    # Off by default, because it is a *replacement* for per-task penalty tuning and
+    # the drivers in experiments/ are tuned. Measured A/B over all ten drivers with
+    # nothing else changed: every task still converges, but the objective is 3.2x
+    # worse in geometric mean and the wall time 1.6x higher, with the worst cases on
+    # cart_transporter (33x objective, 14x time). It reaches a solution in fewer
+    # outer iterations on several tasks -- it just reaches a worse one.
+    #
+    # Turn it on for a problem you have *not* tuned: it balances each block's
+    # effective penalty against the objective instead of asking for a rho_max and a
+    # rho_scale that only a sweep would find.
     auto_rho_init::Bool = false
-    auto_rho_clip_min::Float64 = 1e-2
-    auto_rho_clip_max::Float64 = 1e2
-    # In auto mode, safeguarded growth is capped at
-    # max(rho_max, auto_rho_clip_max/scale^2) for each block. This lets a
-    # small conditioning scale reach the requested effective penalty ceiling.
+    auto_rho_clip_min::Float64 = 1e-2  # clip floor for rho_eff = rho * scale^2
+    auto_rho_clip_max::Float64 = 1e2   # clip ceiling for rho_eff
 
-    # Clip equality and complementarity multipliers to [-s,s], and inequality
-    # multipliers to [0,s], before each inner solve.
-    safeguard_factor::Float64 = 1e6
+    # Multiplier safeguard, applied before each inner solve.
+    safeguard_factor::Float64 = 1e6  # kappa in [-s, s], mu in [0, s]
 
-    # Positive residual multipliers used for conditioning. They affect the
-    # effective penalty rho*scale^2 as well as the residual sent to the X step.
-    fix_point_scale::Float64 = 1
-    dynamics_scale::Float64 = 1
-    eq_scale::Float64 = 1
-    ineq_scale::Float64 = 1
-    comp_scale::Float64 = 1
-    outer_tol_h::Float64 = 1e-5    # Equality and fixed-variable feasibility.
-    outer_tol_g::Float64 = 1e-5    # Positive part of one-sided inequalities.
-    outer_tol_comp::Float64 = 1e-5 # Complementarity product and split residual.
 
+    # Outer loop.
     max_outer_iters::Int = 1000
-    # The inner loop checks the change in the full augmented objective after
-    # each X/slack sweep. It uses inner_tol_init before ramp_start, their
-    # midpoint until ramp_end, then inner_tol_final. Ramp indices are zero-based.
+    outer_tol_h::Float64 = 1e-5     # Equality feasibility tolerance
+    outer_tol_g::Float64 = 1e-5     # Inequality feasibility tolerance
+    outer_tol_comp::Float64 = 1e-5  # Complementarity tolerance
+
+    # Inner loop (BCD sweeps).
     max_inner_iters::Int = 50
-    inner_tol_init::Float64 = 1e-2
-    inner_tol_final::Float64 = 1e-3
+    inner_tol_init::Float64 = 1e-2   # Stagnation tolerance, early outer iters
+    inner_tol_final::Float64 = 1e-3  # Stagnation tolerance, later outer iters
+    # Outer iteration at which the stagnation tolerance steps from inner_tol_init to
+    # their midpoint, and then to inner_tol_final. The schedule is a ramp, not a
+    # cliff: an early subproblem is far from the solution and solving it tightly
+    # wastes inner work, while a late one needs the tight tolerance for the outer
+    # loop to make progress at all.
     inner_tol_ramp_start::Int = 3
     inner_tol_ramp_end::Int = 8
 
     # Optional termination test on the infinity norm of the augmented gradient.
     check_stationarity::Bool = false
-    # If true, compare scale^2*|G_i*H_i| with outer_tol_comp; otherwise compare
-    # the raw product. The split-residual feasibility check uses matching units.
-    conditioned_complementarity::Bool = false
     stationarity_tol::Float64 = 1e-5
     # Restart after this many consecutive stagnant outer iterations if severe
     # infeasibility or nonstationarity remains. Zero disables restarts.
     max_stagnation_restarts::Int = 0
 
-    # Inexact Newton forcing: grad_tol = min(forcing_cap,
-    # max(newton_tol, forcing_factor*previous_outer_violation)).
+    # Solve the GN X-step loosely while feasibility is far off, then tighten as
+    # the outer loop improves: grad_tol = min(cap, max(newton_tol, factor * viol)).
     use_forcing_sequence::Bool = true
     forcing_cap::Float64 = 1e-2
     forcing_factor::Float64 = 0.1
+
     # Damped Gauss-Newton/Newton X update. Damping resets to
     # newton_regularization at each X solve and is adjusted by a gain-ratio rule.
     newton_max_iter::Int = 50
-    newton_tol::Float64 = 1e-6
-    newton_step_tol::Float64 = 1e-8
-    newton_regularization::Float64 = 1e-5
+    newton_tol::Float64 = 1e-6             # Gradient inf-norm tolerance
+    newton_step_tol::Float64 = 1e-8        # Step-norm tolerance
+    newton_regularization::Float64 = 1e-5  # Levenberg-Marquardt damping
     # Damping bounds and retry budget for the gain-ratio Levenberg-Marquardt
     # update. A new minimize! call always starts from newton_regularization.
     newton_lambda_min::Float64 = 1e-12
     newton_lambda_max::Float64 = 1e12
     newton_max_damping_tries::Int = 20
 
-    # Select the saddle KKT step or normal equations for the X update. The saddle
-    # form avoids explicitly building C'*C and is less sensitive to large penalty
-    # values; this Julia path assembles a fresh system from the current Jacobian.
+    # X-update linear-algebra backend (see SaddleLayout). The saddle form is the
+    # default because it is much better conditioned than the normal equations on
+    # dense single-shooting problems.
     use_saddle::Bool = true
-    saddle_sigma_primal::Float64 = 1e-8
-    # Congruence-scale each dual row using its Jacobian norm to reduce badly
-    # scaled pivots while leaving the primal step unchanged in exact arithmetic.
-    saddle_equilibrate_dual::Bool = true
-    # Optional iterative refinement of the saddle solve, using the same factors.
-    saddle_refinement_steps::Int = 0
-    # 0 is quiet; values >=1 log the outer-iteration summary.
+    saddle_sigma_primal::Float64 = 1e-8   # Primal proximal floor on the (1,1) block
+    saddle_equilibrate_dual::Bool = true  # Diagonal dual-row scaling
+    saddle_refinement_steps::Int = 0      # Optional iterative refinement steps
+
+    # 0 silent, 1 outer summary, 2 inner, 3 inner GN
     print_level::Int = 1
 end
 
+
 function validate(config::AulaConfig)
-    config.max_outer_iters > 0 && config.max_inner_iters > 0 && config.newton_max_iter > 0 ||
-        throw(ArgumentError("iteration limits must be positive"))
-    config.rho_scale > 1 && config.rho_max > 0 &&
-        0 <= config.penalty_decrease_ratio <= 1 ||
-        throw(ArgumentError("invalid safeguarded penalty configuration"))
-    config.newton_regularization > 0 && config.newton_lambda_min > 0 &&
-        config.newton_lambda_max >= config.newton_lambda_min ||
-        throw(ArgumentError("invalid Levenberg-Marquardt damping configuration"))
-    config.rho_fix_point_init > 0 && config.rho_dynamics_init > 0 &&
-        config.rho_eq_init > 0 && config.rho_ineq_init > 0 && config.rho_comp_init > 0 ||
-        throw(ArgumentError("initial penalty values must be positive"))
-    config.outer_tol_h > 0 && config.outer_tol_g > 0 && config.outer_tol_comp > 0 ||
-        throw(ArgumentError("constraint tolerances must be positive"))
-    config.max_stagnation_restarts >= 0 ||
-        throw(ArgumentError("max_stagnation_restarts must be nonnegative"))
-    if config.check_stationarity
-        isfinite(config.stationarity_tol) && config.stationarity_tol > 0 ||
-            throw(ArgumentError("stationarity_tol must be finite and positive"))
+    for name in (:rho_eq_init, :rho_ineq_init, :rho_comp_init, :rho_max,
+                 :auto_rho_clip_min, :auto_rho_clip_max, :safeguard_factor,
+                 :outer_tol_h, :outer_tol_g, :outer_tol_comp,
+                 :inner_tol_init, :inner_tol_final, :stationarity_tol,
+                 :forcing_cap, :forcing_factor, :newton_tol, :newton_step_tol,
+                 :newton_regularization, :newton_lambda_min, :newton_lambda_max,
+                 :saddle_sigma_primal)
+        value = getfield(config, name)
+        isfinite(value) && value > 0 ||
+            throw(ArgumentError("$name must be finite and positive"))
     end
-    config.auto_rho_clip_min > 0 && config.auto_rho_clip_max >= config.auto_rho_clip_min ||
-        throw(ArgumentError("invalid automatic penalty initialization bounds"))
-    for (name, s) in ((:fix_point_scale, config.fix_point_scale),
-                      (:dynamics_scale, config.dynamics_scale),
-                      (:eq_scale, config.eq_scale), (:ineq_scale, config.ineq_scale),
-                      (:comp_scale, config.comp_scale))
-        isfinite(s) && s > 0 || throw(ArgumentError("$name must be finite and positive"))
+    isfinite(config.rho_scale) && config.rho_scale > 1 ||
+        throw(ArgumentError("rho_scale must be finite and greater than 1"))
+    isfinite(config.penalty_decrease_ratio) && 0 <= config.penalty_decrease_ratio <= 1 ||
+        throw(ArgumentError("penalty_decrease_ratio must be finite and in [0, 1]"))
+
+    for name in (:max_outer_iters, :max_inner_iters, :newton_max_iter,
+                 :newton_max_damping_tries)
+        getfield(config, name) > 0 || throw(ArgumentError("$name must be positive"))
     end
+    for name in (:inner_tol_ramp_start, :inner_tol_ramp_end,
+                 :max_stagnation_restarts, :saddle_refinement_steps)
+        getfield(config, name) >= 0 || throw(ArgumentError("$name must be nonnegative"))
+    end
+    0 <= config.print_level <= 3 ||
+        throw(ArgumentError("print_level must be in 0:3"))
+    config.auto_rho_clip_min <= config.auto_rho_clip_max ||
+        throw(ArgumentError("auto_rho_clip_min must not exceed auto_rho_clip_max"))
+    config.inner_tol_ramp_start <= config.inner_tol_ramp_end ||
+        throw(ArgumentError("inner_tol_ramp_start must not exceed inner_tol_ramp_end"))
+    config.newton_lambda_min <= config.newton_lambda_max ||
+        throw(ArgumentError("newton_lambda_min must not exceed newton_lambda_max"))
     return config
 end
