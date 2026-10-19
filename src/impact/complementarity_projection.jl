@@ -1,34 +1,35 @@
-"""Exact pairwise slack minimizer for the disjunctive complementarity set.
+"""Closed-form (Y, Z)-update used inside the BCD loop.
 
-For each pair, compare the minimizers on the two branches `(sG ≥ 0, sH = 0)`
-and `(sG = 0, sH ≥ 0)`. This is the same closed-form BCD update used in
-`impact_solver`; no product relaxation or smoothing is introduced.
+With the trajectory variables X fixed, the augmented-Lagrangian objective
+decouples across complementarity pairs. For each scalar pair (y_i, z_i) under
+the hard constraint 0 <= y_i ⊥ z_i >= 0, the exact minimiser is one of two
+candidates (one branch per leg of the complementarity set):
 
-For the first branch, the scalar minimizer is
-`sG = max(0, G + kappaG/(rho*scale))`, `sH = 0`. For the second it is
-`sG = 0`, `sH = max(0, H + kappaH/(rho*scale))`. The shifted residuals
-`aG = scale*G + kappaG/rho` and `aH = scale*H + kappaH/rho` give branch costs
-`min(aG,0)^2 + aH^2` and `aG^2 + min(aH,0)^2`; choosing the smaller cost is the
-exact minimizer over the complementarity set for that pair.
+  Case 1 (z_i = 0):  y_i* = max(0, G_i + kappaG_i / rho)
+  Case 2 (y_i = 0):  z_i* = max(0, H_i + kappaH_i / rho)
+
+We evaluate the penalty contribution of each candidate and keep the smaller one.
+Writing the shifted residuals  aG = G + kappaG/rho,  aH = H + kappaH/rho,
+the two costs reduce to  cost1 = min(aG,0)^2 + aH^2  and  cost2 = aG^2 + min(aH,0)^2.
+
+This is an exact block minimisation, so it never increases the objective. The
+implementation is vectorised over all complementarity pairs with Eigen arrays.
 """
-function project_complementarity!(comp::CompBlock, G::AbstractVector, H::AbstractVector)
-    length(G) == comp.dim == length(H) || throw(DimensionMismatch("complementarity block size"))
-    ρ, s = comp.rho, comp.scale
-    rs = ρ * s
-    aG = s .* G .+ comp.kappaG ./ ρ
-    aH = s .* H .+ comp.kappaH ./ ρ
-    sG_one = max.(G .+ comp.kappaG ./ rs, zero(eltype(G)))
-    sH_two = max.(H .+ comp.kappaH ./ rs, zero(eltype(H)))
-    costG = min.(aG, zero(eltype(G))).^2 .+ aH.^2
-    costH = aG.^2 .+ min.(aH, zero(eltype(H))).^2
-    for i in eachindex(G)
-        if costG[i] <= costH[i]
-            comp.sG[i] = sG_one[i]
-            comp.sH[i] = 0
+function project_complementarity!(G::AbstractVector{T}, H::AbstractVector{T},
+                                 kappaG::AbstractVector{T}, kappaH::AbstractVector{T}, rho_comp::T,
+                                 sG::AbstractVector{T}, sH::AbstractVector{T}) where {T<:AbstractFloat}
+    for i in eachindex(G, H, kappaG, kappaH, sG, sH)
+        aG = G[i] + kappaG[i] / rho_comp
+        aH = H[i] + kappaH[i] / rho_comp
+        cost1 = abs2(min(aG, zero(T))) + abs2(aH)
+        cost2 = abs2(aG) + abs2(min(aH, zero(T)))
+        if cost1 <= cost2
+            sG[i] = max(aG, zero(T))
+            sH[i] = zero(T)
         else
-            comp.sG[i] = 0
-            comp.sH[i] = sH_two[i]
+            sG[i] = zero(T)
+            sH[i] = max(aH, zero(T))
         end
     end
-    return comp.sG, comp.sH
+    return nothing
 end
