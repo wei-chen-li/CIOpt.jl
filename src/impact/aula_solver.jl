@@ -146,7 +146,7 @@ function solve!(solver::AulaSolver, sub::AulaSubproblem, config::AulaConfig,
 
             if ncomp > 0
                 G, H = eval_GH(sub, z)
-                project_comp!(G, H, p)
+                project_complementarity!(G, H, p.kappaG, p.kappaH, p.rho_comp, p.sG, p.sH)
             end
 
             phi_S = eval_al_objective(sub, z, p)
@@ -252,7 +252,7 @@ function solve!(solver::AulaSolver, sub::AulaSubproblem, config::AulaConfig,
                 p = make_params(sub)
                 if ncomp > 0
                     G, H = eval_GH(sub, z)
-                    project_comp!(G, H, p)
+                    project_complementarity!(G, H, p.kappaG, p.kappaH, p.rho_comp, p.sG, p.sH)
                 end
                 for old in v_prev
                     fill!(old, INF)
@@ -314,18 +314,7 @@ decrease enough since the previous outer iteration.
 function safeguarded_penalty(rho, v_new, v_old, tol, eta, gamma, rho_max)
     violating = v_new >= tol
     insufficient_decrease = v_new > eta * v_old
-    return violating && insufficient_decrease ? min(rho * gamma,rho_max) : rho
-end
-
-
-"""Per-complementarity slack projection."""
-function project_comp!(G, H, p)
-    for i in eachindex(G,H,p.rho_comp)
-        range = i:i
-        project_complementarity!(view(G, range), view(H, range),
-            view(p.kappaG, range), view(p.kappaH, range), p.rho_comp[i],
-            view(p.sG, range), view(p.sH, range))
-    end
+    return violating && insufficient_decrease ? min(rho * gamma, rho_max) : rho
 end
 
 

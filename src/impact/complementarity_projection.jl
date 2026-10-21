@@ -12,15 +12,21 @@ We evaluate the penalty contribution of each candidate and keep the smaller one.
 Writing the shifted residuals  aG = G + kappaG/rho,  aH = H + kappaH/rho,
 the two costs reduce to  cost1 = min(aG,0)^2 + aH^2  and  cost2 = aG^2 + min(aH,0)^2.
 
-This is an exact block minimisation, so it never increases the objective. The
-implementation is vectorised over all complementarity pairs with Eigen arrays.
+This is an exact block minimisation, so it never increases the objective.
+`rho_comp` may be a scalar shared by all pairs or a vector with one penalty per
+pair. For vector penalties, the divisions above are componentwise.
 """
 function project_complementarity!(G::AbstractVector{T}, H::AbstractVector{T},
-                                 kappaG::AbstractVector{T}, kappaH::AbstractVector{T}, rho_comp::T,
+                                 kappaG::AbstractVector{T}, kappaH::AbstractVector{T},
+                                 rho_comp::Union{Real,AbstractVector{<:Real}},
                                  sG::AbstractVector{T}, sH::AbstractVector{T}) where {T<:AbstractFloat}
-    for i in eachindex(G, H, kappaG, kappaH, sG, sH)
-        aG = G[i] + kappaG[i] / rho_comp
-        aH = H[i] + kappaH[i] / rho_comp
+    vector_rho = rho_comp isa AbstractVector
+    indices = vector_rho ? eachindex(G, H, kappaG, kappaH, rho_comp, sG, sH) :
+                           eachindex(G, H, kappaG, kappaH, sG, sH)
+    for i in indices
+        rho = vector_rho ? rho_comp[i] : rho_comp
+        aG = G[i] + kappaG[i] / rho
+        aH = H[i] + kappaH[i] / rho
         cost1 = abs2(min(aG, zero(T))) + abs2(aH)
         cost2 = abs2(aG) + abs2(min(aH, zero(T)))
         if cost1 <= cost2
