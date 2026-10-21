@@ -4,7 +4,6 @@ using NLPModels
 using SparseArrays
 
 include("aula_config.jl")
-include("dual_block.jl")
 include("saddle_layout.jl")
 include("complementarity_projection.jl")
 include("aula_subproblem.jl")
@@ -18,17 +17,16 @@ export ImpactSolver, solve!
 
 `kwargs` accepts keyword arguments corresponding to fields of `AulaConfig`.
 """
-mutable struct ImpactSolver{M,T<:AbstractFloat}
-    mpcc::M
-    config::AulaConfig
-    subproblem::AulaSubproblem{M,T}
+mutable struct ImpactSolver
     aula_solver::AulaSolver
+    aula_subproblem::AulaSubproblem
+    aula_config::AulaConfig
 end
 
 function ImpactSolver(mpcc::MPCCModels.AbstractMPCCModel; kwargs...)
-    config = validate(AulaConfig(; kwargs...))
-    subproblem = AulaSubproblem(mpcc, config)
-    return ImpactSolver(mpcc, config, subproblem, AulaSolver())
+    aula_config = validate(AulaConfig(; kwargs...))
+    aula_subproblem = AulaSubproblem(mpcc, aula_config)
+    return ImpactSolver(AulaSolver(), aula_subproblem, aula_config)
 end
 
 """
@@ -38,6 +36,7 @@ Solve the MPCC stored in `solver`, mutating its AuLa and Gauss-Newton state.
 Returns the `AulaResult` from this solve.
 """
 function solve!(solver::ImpactSolver)
-    x_init = NLPModels.get_x0(solver.mpcc)
-    return solve!(solver.aula_solver, solver.subproblem, solver.config, x_init)
+    s = solver
+    x_init = NLPModels.get_x0(s.aula_subproblem.model)
+    return solve!(s.aula_solver, s.aula_subproblem, s.aula_config, x_init)
 end

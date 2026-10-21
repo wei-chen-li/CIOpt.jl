@@ -1,400 +1,327 @@
+"""AuLa result. `z` is the raw decision vector.
+Status is `:converged`, `:max_iterations`, or `:linear_algebra_failure`.
 """
-Violation record for one final constraint channel. Standard constraint
-violations are reported unscaled; for complementarity, `violation` is the raw
-`||G .* H||_∞` product and `residual_violation` measures distance from `G,H` to
-the projected complementary slacks.
-"""
-struct ConstraintViolation{T<:AbstractFloat}
-    name::String
-    violation::T
-    residual_violation::T
+Base.@kwdef mutable struct AulaResult{T<:AbstractFloat}
+    z::Vector{T}
+
+    objective_value::T = zero(T)            # f(z)
+    equality_violation::T = zero(T)         # ‖h(z)‖_inf
+    inequality_violation::T = zero(T)       # ‖max(g(z), 0)‖_inf
+    complementarity_violation::T = zero(T)  # ‖G(z) ∘ H(z)‖_inf
+    stationarity_violation::T = zero(T)     # ‖∇ Lᵨ(z)‖_inf
+
+    comp_neg_G::T = zero(T)                 # ‖min(G(z), 0)‖_inf
+    comp_neg_H::T = zero(T)                 # ‖min(H(z), 0)‖_inf
+    comp_support_G::T = zero(T)             # ‖min(max(G(z), 0), kappaG)‖_inf
+    comp_support_H::T = zero(T)             # ‖min(max(H(z), 0), kappaH)‖_inf
+
+    converged::Bool = false
+    status::Symbol = :max_iterations
+    status_message::String = ""
+
+    outer_iterations::Int = 0
+    total_inner_iterations::Int = 0
+    total_gn_iterations::Int = 0
+
+    solve_time::Float64 = 0.0
+    eval_time::Float64 = 0.0
+    factor_time::Float64 = 0.0
 end
 
-"""
-Result of an AuLa solve. `x` and `objective_value` are the final primal point and
-original model objective. Feasibility fields use raw, unscaled units. The four
-`comp_*` fields report nonnegativity and multiplier-support certificates for
-the complementarity pairs. `total_gn_iterations` counts accepted X steps.
-`eval_time` and `factor_time` count work inside X updates; `solve_time` also
-includes the outer loop and its bookkeeping. `stationarity_violation` is zero
-when stationarity checking is disabled. `converged` is true exactly when
-`status == :converged`.
-"""
-struct AulaResult{T<:AbstractFloat}
-    x::Vector{T}
-    objective_value::T
-    converged::Bool
-    status::Symbol
-    status_message::String
-    outer_iterations::Int
-    total_inner_iterations::Int
-    total_gn_iterations::Int
-    equality_violation::T
-    inequality_violation::T
-    complementarity_violation::T
-    stationarity_violation::T
-    comp_neg_G::T
-    comp_neg_H::T
-    comp_support_G::T
-    comp_support_H::T
-    constraint_violations::Vector{ConstraintViolation{T}}
-    solve_time::Float64
-    eval_time::Float64
-    factor_time::Float64
-end
 
-"""
-    AulaSolver()
+"""Safeguarded Augmented-Lagrangian solver with an inner BCD loop.
 
-AuLa driver with a reusable damped Gauss-Newton X-step state. One solver object
-can be reused for successive `solve!` calls; each outer solve resets its timers
-and each X solve starts with the configured LM damping.
+The solver consumes an AulaSubproblem, independent of the task that produced
+it. In broad strokes it runs:
+
+   Outer (Algorithm 1): clip every dual block's multiplier to the safeguard box,
+   solve the AuLa subproblem inexactly, dual-ascend each multiplier, then apply a
+   per-block *safeguarded* penalty increase (rho grows only when a block's
+   violation fails to decrease enough between outer iterations).
+
+   Inner (Algorithm 2): block coordinate descent alternating a damped
+   Gauss-Newton X-update (GaussNewtonSolver) with the closed-form complementarity
+   (Y,Z)-update (projectComplementarity), stopping on objective stagnation.
 """
 mutable struct AulaSolver
     gn::GaussNewtonSolver
 end
 AulaSolver() = AulaSolver(GaussNewtonSolver())
 
-_block_raw(sub, x, b) = eval_block_source(sub, x, b)
-_inf(v) = isempty(v) ? 0.0 : norm(v, Inf)
-_sqscale(s) = s > 0 ? s^2 : 1.0
+function solve!(solver::AulaSolver, sub::AulaSubproblem{M,T}, config::AulaConfig,
+                z_init::AbstractVector) where {M,T}
+    t_start = time_ns()
+    length(z_init) == sub.nvar && all(isfinite,z_init) ||
+        throw(ArgumentError("AulaSolver: invalid initial decision vector"))
 
-function _balanced_rho_eff(d2, f_abs, config)
-    # Choose an effective penalty so rho_eff*||c||^2 is comparable to the
-    # objective magnitude. d2 is expressed in unscaled residual units.
-    clamp(2 * max(1, f_abs) / d2, config.auto_rho_clip_min, config.auto_rho_clip_max)
-end
+    # Bind the Gauss-Newton X-solver to this subproblem.
+    gn_cfg = GaussNewtonConfig(config)
+    f, p = sub.functions, make_params(sub)
+    residual = (x, p)->eval_residual(sub, x, p)
+    jacobian = (x, p)->eval_jacobian(sub, x, p)
+    init(solver.gn, f.ℓ, f.∇ℓ, f.∇²ℓ, residual, jacobian, gn_cfg)
+    gn = solver.gn
 
-function _comp_distance2(comp, G, H)
-    # Squared distance from each (G_i,H_i) to the union of the two
-    # complementarity branches. This gives auto-rho initialization without
-    # needing rho first, so it avoids a rho -> projection -> rho cycle.
-    d2 = 0.0
-    for i in 1:comp.dim
-        nG, nH = min(G[i], 0), min(H[i], 0)
-        d2 += min(nG^2 + H[i]^2, G[i]^2 + nH^2)
+    z = Vector{T}(z_init)
+    neq, nineq, ncomp = length(p.kappa_eq), length(p.kappa_ineq), length(p.kappaG)
+
+    # Previous violations for the penalty safeguards and forcing sequence.
+    INF = T(Inf)
+    v_prev = (eq=fill(INF,neq), ineq=fill(INF,nineq), comp=fill(INF,ncomp))
+    outer_viol_prev = T(1e3)
+
+    s, eta, gamma = config.safeguard_factor, config.penalty_decrease_ratio, config.rho_scale
+    G, H = zeros(T,ncomp), zeros(T,ncomp)
+
+    # Balanced initial penalties (Birgin-Martinez): pick each block's rho_0 so that
+    # at z_init the penalty term rho * ||c||^2 matches the objective's magnitude,
+    # instead of trusting the build-time rho_*_init seeds.
+    rho_balanced = (eq=trues(neq), ineq=trues(nineq), comp=trues(ncomp))
+    balanced_rho(d2,f_abs) = clamp(2 * max(1, f_abs) / d2,
+                                  config.auto_rho_clip_min, config.auto_rho_clip_max)
+    if config.auto_rho_init
+        f0 = abs(eval_task_objective(sub, z, p))
+        eq, ineq = copy(f.h(z, p)), copy(f.g(z, p))
+        G, H = eval_gh(sub, z, p)
+        d2_comp = min.(abs2.(min.(G,0)) + abs2.(H), abs2.(G) + abs2.(min.(H,0)))
+        for (rho, d2 ,done) in ((p.rho_eq,   abs2.(eq),           rho_balanced.eq),
+                                (p.rho_ineq, abs2.(max.(ineq,0)), rho_balanced.ineq),
+                                (p.rho_comp, d2_comp,             rho_balanced.comp))
+            for i in eachindex(rho)
+                done[i] = d2[i] > 1
+                done[i] && (rho[i] = balanced_rho(d2[i], f0))
+            end
+        end
     end
-    return d2
-end
 
-function _safe_penalty(rho, vnew, vold, tol, config, scale)
-    # Increase rho only when feasibility is still outside tolerance and the
-    # violation did not improve by the configured safeguard ratio. Auto-rho
-    # mode caps effective stiffness rho*scale^2, not nominal rho alone. The
-    # per-block cap lets a small scale reach the effective ceiling; max(rho_max,
-    # ...) preserves the configured nominal headroom for larger scales.
-    if vnew >= tol && vnew > config.penalty_decrease_ratio * vold
-        cap = config.auto_rho_init ? max(config.rho_max, config.auto_rho_clip_max / _sqscale(scale)) : config.rho_max
-        return min(rho * config.rho_scale, cap)
+    if config.print_level >= 1
+        println(repeat("=",60),"\nBCD-AuLa (IMPACT) Solver\n",repeat("=",60))
+        println("Variables: ",sub.nvar,", equality: ",neq,", inequality: ",nineq,
+                ", complementarity pairs: ",ncomp)
     end
-    return rho
-end
 
-function _current_comp(sub, x)
-    isempty(sub.comp_blocks) && return Vector{Float64}(), Vector{Float64}()
-    return MPCCModels.comp_res_left(sub.model, x), MPCCModels.comp_res_right(sub.model, x)
-end
-
-function _reset_penalties!(sub, config)
-    # A stagnation restart discards stale multipliers, slacks, and grown
-    # penalties, returning every channel to its build-time seed.
-    for b in sub.dual_blocks
-        fill!(b.kappa, 0)
-        b.rho = b.rho_init
-    end
-    for c in sub.comp_blocks
-        fill!(c.kappaG, 0); fill!(c.kappaH, 0)
-        fill!(c.sG, 0); fill!(c.sH, 0)
-        c.rho = c.rho_init
-    end
-    sync_params!(sub)
-end
-
-"""
-    solve!(solver, subproblem, config, x_init)
-
-Run impact's safeguarded AuLa method on a model-backed subproblem. Each outer
-iteration clips multipliers, approximately minimizes the augmented objective,
-ascends standard and split complementarity multipliers, then increases only
-those penalties whose violations have stalled. The inner BCD loop alternates a
-damped primal X update with the exact closed-form complementarity slack update.
-
-Convergence requires every standard block to meet its unscaled feasibility
-tolerance. Each complementarity block must meet both its product test and its
-split-slack residual test. If requested, stationarity of the augmented
-Lagrangian is checked after feasibility is reached.
-"""
-function solve!(solver::AulaSolver, sub::AulaSubproblem, config::AulaConfig,
-                x_init::AbstractVector)
-    validate(config)
-    T = eltype(sub.parameter_buffer)
-    check_stationarity = sub.stationarity_enabled
-    conditioned_comp = sub.conditioned_complementarity
-    stationarity_tol = sub.stationarity_tol
-    x = T.(x_init)
-    length(x) == sub.nvar && all(isfinite, x) || throw(ArgumentError("invalid initial point"))
+    converged = false
+    any_la_failure = false
+    stagnant_outer = 0
+    stagnation_restarts = 0
+    outer_iters = 0
     total_inner = 0
     total_gn = 0
-    solver.gn.eval_seconds = 0.0
-    solver.gn.factor_seconds = 0.0
-    converged = false
-    la_failure = false
-    ρbalanced = fill(!config.auto_rho_init, length(sub.dual_blocks))
-    ρcompbalanced = fill(!config.auto_rho_init, length(sub.comp_blocks))
-    # Previous violations start at +Inf. The safeguard therefore leaves rho
-    # unchanged on the first outer pass, before it can compare progress.
-    vprev = fill(Inf, length(sub.dual_blocks))
-    vcprev = fill(Inf, length(sub.comp_blocks))
-    outer_viol_prev = 1e3
-    stagnant_outer = 0
-    restart_count = 0
-    nouter = 0
 
-    if config.auto_rho_init
-        # Balance initially infeasible blocks against the objective in effective
-        # units. Blocks starting close to feasible keep their configured seed;
-        # their first informative residual is handled by the deferred pass below.
-        f0 = abs(NLPModels.obj(sub.model, x))
-        for (i, b) in enumerate(sub.dual_blocks)
-            c = b.scale .* _block_raw(sub, x, b)
-            b.kind === :inequality && (c = max.(c, 0))
-            d2 = sum(abs2, c) / _sqscale(b.scale)
-            ρbalanced[i] = d2 > 1
-            b.rho = ρbalanced[i] ? _balanced_rho_eff(d2, f0, config) / _sqscale(b.scale) : b.rho_init
-        end
-        if !isempty(sub.comp_blocks)
-            G, H = _current_comp(sub, x)
-            for (i, c) in enumerate(sub.comp_blocks)
-                d2 = _comp_distance2(c, G, H)
-                ρcompbalanced[i] = d2 > 1
-                c.rho = ρcompbalanced[i] ? _balanced_rho_eff(d2, f0, config) / _sqscale(c.scale) : c.rho_init
-            end
-        end
-    end
+    for outer_iter in 0:(config.max_outer_iters - 1)
+        outer_iters = outer_iter
 
-    previous_point = copy(x)
-    start_time = time_ns()
-    for outer in 1:config.max_outer_iters
-        nouter = outer
-        previous_point .= x
-        # Bound multipliers before each inexact inner solve: equality and split
-        # complementarity multipliers may have either sign, while inequality
-        # multipliers must remain nonnegative.
-        for b in sub.dual_blocks
-            if b.kind === :inequality
-                b.kappa .= clamp.(b.kappa, 0, config.safeguard_factor)
-            else
-                b.kappa .= clamp.(b.kappa, -config.safeguard_factor, config.safeguard_factor)
-            end
-        end
-        for c in sub.comp_blocks
-            c.kappaG .= clamp.(c.kappaG, -config.safeguard_factor, config.safeguard_factor)
-            c.kappaH .= clamp.(c.kappaH, -config.safeguard_factor, config.safeguard_factor)
-        end
-        sync_params!(sub)
+        z_outer_start = copy(z)
+        # Clip multipliers before the inner solve.
+        p.kappa_eq .= clamp.(p.kappa_eq, -s, s)
+        p.kappa_ineq .= clamp.(p.kappa_ineq, 0, s)
+        p.kappaG .= clamp.(p.kappaG, -s, s)
+        p.kappaH .= clamp.(p.kappaH, -s, s)
 
-        outer_index = outer - 1
-        # A loose early stopping threshold avoids oversolving poor subproblems;
-        # later outer iterations use the tighter threshold needed for progress.
-        inner_tol = outer_index < config.inner_tol_ramp_start ? config.inner_tol_init :
-                    outer_index < config.inner_tol_ramp_end ? (config.inner_tol_init + config.inner_tol_final) / 2 :
-                    config.inner_tol_final
-        # Compare complete BCD sweeps (X step plus slack projection), not just
-        # the change from the X step, when checking inner stagnation.
-        ϕprev = evaluate_augmented(sub, x)[1]
-        for _ in 1:config.max_inner_iters
+        inner_tol = (
+            (outer_iter < config.inner_tol_ramp_start)
+                ? config.inner_tol_init
+                : (outer_iter < config.inner_tol_ramp_end)
+                    ? 0.5 * (config.inner_tol_init + config.inner_tol_final)
+                    : config.inner_tol_final)
+
+        # Inner BCD loop: alternate the GN X-update and the closed-form slack update.
+        phi_prev = eval_augmented_objective(sub, z, p)
+        for inner in 0:(config.max_inner_iters-1)
             total_inner += 1
-            # Inexact Newton forcing: relax the gradient target in proportion to
-            # the previous outer violation, but never above the configured cap.
-            gn_tol = config.use_forcing_sequence ?
-                min(config.forcing_cap, max(config.newton_tol, config.forcing_factor * outer_viol_prev)) : -1.0
-            minimize!(solver.gn, sub, x, config; grad_tol=gn_tol)
-            la_failure |= solver.gn.x_update_failed
-            total_gn += solver.gn.iterations
-            if !isempty(sub.comp_blocks)
-                G, H = _current_comp(sub, x)
-                for c in sub.comp_blocks
-                    project_complementarity!(c, G, H)
-                end
-                sync_params!(sub)
+
+            gn_tol = (
+                config.use_forcing_sequence
+                    ? min(config.forcing_cap,
+                          max(config.newton_tol,
+                              config.forcing_factor * outer_viol_prev))
+                    : -1.0)
+            solve!(gn, p, z; grad_tol=gn_tol)
+            any_la_failure |= gn.last_x_update_failed
+            total_gn += gn.last_iterations
+
+            if ncomp > 0
+                G, H = eval_gh(sub, z, p)
+                project_comp!(G, H, p)
             end
-            ϕ = evaluate_augmented(sub, x)[1]
-            abs(ϕprev - ϕ) < inner_tol && break
-            ϕprev = ϕ
+
+            phi_S = eval_augmented_objective(sub, z, p)
+            config.print_level >= 2 && println("  Inner $inner: phi=$phi_S")
+            abs(phi_prev - phi_S) < inner_tol && break
+            phi_prev = phi_S
         end
 
-        G, H = _current_comp(sub, x)
-        scaled_violations = zeros(T, length(sub.dual_blocks))
-        unscaled_violations = zeros(T, length(sub.dual_blocks))
-        # Dual ascent uses scaled residuals. Inequality multipliers are projected
-        # back onto the nonnegative orthant after each ascent.
-        for (i, b) in enumerate(sub.dual_blocks)
-            raw = _block_raw(sub, x, b)
-            scaled = b.scale .* raw
-            if b.kind === :inequality
-                b.kappa .= max.(b.kappa .+ b.rho .* scaled, 0)
-                scaled_violations[i] = _inf(max.(scaled, 0))
-                unscaled_violations[i] = _inf(max.(raw, 0))
-            else
-                b.kappa .+= b.rho .* scaled
-                scaled_violations[i] = _inf(scaled)
-                unscaled_violations[i] = _inf(raw)
+        # Dual ascent and scaled violation measurement for equalities and inequalities.
+        eq, ineq = copy(f.h(z,p)), copy(f.g(z,p))
+        p.kappa_eq .= p.kappa_eq + p.rho_eq .* eq
+        p.kappa_ineq .= max.(p.kappa_ineq + p.rho_ineq .* ineq, 0)
+        v_eq = abs.(eq)
+        v_ineq = max.(ineq,0)
+
+        # Complementarity dual ascent on the split G/H residuals.
+        comp_res_G, comp_res_H = G - p.sG, H - p.sH
+        p.kappaG .+= p.rho_comp .* comp_res_G
+        p.kappaH .+= p.rho_comp .* comp_res_H
+        v_comp = max.(abs.(comp_res_G), abs.(comp_res_H))
+        comp_products = abs.(G .* H)
+        comp_prod = inf_norm(comp_products)
+
+        # Update per-constraint penalties from violations.
+        rho_cap = (config.auto_rho_init
+                    ? max(config.rho_max, config.auto_rho_clip_max)
+                    : config.rho_max)
+        for (rho, v, old, tol) in ((p.rho_eq,   v_eq,   v_prev.eq,   config.outer_tol_h),
+                                   (p.rho_ineq, v_ineq, v_prev.ineq, config.outer_tol_g),
+                                   (p.rho_comp, v_comp, v_prev.comp, config.outer_tol_comp))
+            for i in eachindex(rho)
+                rho[i] = safeguarded_penalty(rho[i], v[i], old[i], tol, eta, gamma, rho_cap)
+                old[i] = v[i]
             end
         end
-        comp_prod_blocks = zeros(T, length(sub.comp_blocks))
-        comp_split_blocks = zeros(T, length(sub.comp_blocks))
-        comp_term_blocks = zeros(T, length(sub.comp_blocks))
-        comp_res2 = zeros(T, length(sub.comp_blocks))
-        # The complementarity channels ascend on both split-slack residuals;
-        # the product and split residual are kept separately for termination.
-        for (i, c) in enumerate(sub.comp_blocks)
-            rG = c.scale .* (G .- c.sG)
-            rH = c.scale .* (H .- c.sH)
-            c.kappaG .+= c.rho .* rG
-            c.kappaH .+= c.rho .* rH
-            comp_prod_blocks[i] = _inf(G .* H)
-            comp_split_blocks[i] = max(_inf(rG), _inf(rH))
-            comp_term_blocks[i] = conditioned_comp ? c.scale^2 * comp_prod_blocks[i] : comp_prod_blocks[i]
-            comp_res2[i] = sum(abs2, G .- c.sG) + sum(abs2, H .- c.sH)
-        end
-        sync_params!(sub)
 
-        # Penalty safeguards and convergence use unscaled violations, matching
-        # the caller's tolerances even when a residual conditioning scale is used.
-        for (i, b) in enumerate(sub.dual_blocks)
-            b.rho = _safe_penalty(b.rho, unscaled_violations[i], vprev[i], b.tol, config, b.scale)
-            vprev[i] = unscaled_violations[i]
-        end
-        for (i, c) in enumerate(sub.comp_blocks)
-            v = conditioned_comp ? comp_split_blocks[i] : comp_split_blocks[i] / c.scale
-            c.rho = _safe_penalty(c.rho, v, vcprev[i], c.tol, config, c.scale)
-            vcprev[i] = v
-        end
-
-        # A block that started nearly feasible carries no useful scale
-        # information at x0. Balance it once its residual becomes measurable,
-        # preserving any penalty growth already made by the safeguard.
-        if config.auto_rho_init && (!all(ρbalanced) || !all(ρcompbalanced))
-            fnow = abs(NLPModels.obj(sub.model, x))
-            for (i, b) in enumerate(sub.dual_blocks)
-                ρbalanced[i] && continue
-                c = b.scale .* _block_raw(sub, x, b)
-                b.kind === :inequality && (c = max.(c, 0))
-                d2 = sum(abs2, c) / _sqscale(b.scale)
-                if d2 > 1
-                    b.rho = max(b.rho, _balanced_rho_eff(d2, fnow, config) / _sqscale(b.scale))
-                    ρbalanced[i] = true
-                end
-            end
-            for (i, c) in enumerate(sub.comp_blocks)
-                ρcompbalanced[i] && continue
-                if comp_res2[i] > 1
-                    c.rho = max(c.rho, _balanced_rho_eff(comp_res2[i], fnow, config) / _sqscale(c.scale))
-                    ρcompbalanced[i] = true
+        # Deferred balancing (auto_rho_init): a block that started (near-)feasible
+        # was seeded with the scale-free neutral value; the first outer iteration
+        # that hands it a measurable residual supplies the scale the balance formula
+        # needs, and the block is balanced once, here. max() keeps any safeguard
+        # growth that already happened. Costs one residual eval per still-unbalanced
+        # block per outer iteration, and nothing once every block is balanced.
+        if config.auto_rho_init && any(!all(done) for done in rho_balanced)
+            f_cur = abs(eval_task_objective(sub, z, p))
+            d2_comp = abs2.(comp_res_G) + abs2.(comp_res_H)
+            for (rho, d2, done) in ((p.rho_eq,   abs2.(eq),           rho_balanced.eq),
+                                    (p.rho_ineq, abs2.(max.(ineq,0)), rho_balanced.ineq),
+                                    (p.rho_comp, d2_comp,             rho_balanced.comp))
+                for i in eachindex(rho)
+                    if !done[i] && d2[i] > 1
+                        rho[i] = max(rho[i], balanced_rho(d2[i], f_cur))
+                        done[i] = true
+                    end
                 end
             end
         end
 
-        # Complementarity has two independent feasibility conditions: the raw
-        # product certifies G*H≈0, while the split residual certifies that the
-        # original G,H values agree with their nonnegative complementary slacks.
-        feasible = true
-        max_v = 0.0
-        for (i, b) in enumerate(sub.dual_blocks)
-            max_v = max(max_v, unscaled_violations[i])
-            unscaled_violations[i] < b.tol || (feasible = false)
-        end
-        comp_res_u = 0.0
-        for (i, c) in enumerate(sub.comp_blocks)
-            split_test = conditioned_comp ? comp_split_blocks[i] : comp_split_blocks[i] / c.scale
-            comp_res_u = max(comp_res_u, split_test)
-            (comp_term_blocks[i] < c.tol && split_test < c.tol) || (feasible = false)
-        end
-        outer_viol_prev = max(max_v, comp_res_u, maximum(comp_term_blocks; init=0.0))
+        feasible = all(<(config.outer_tol_h), v_eq) &&
+                   all(<(config.outer_tol_g), v_ineq) &&
+                   all(<(config.outer_tol_comp), v_comp) &&
+                   all(<(config.outer_tol_comp), comp_products)
 
-        stationarity = Inf
-        if feasible && check_stationarity
-            stationarity = _inf(evaluate_augmented(sub, x)[2])
+        outer_viol_prev = max(inf_norm(v_eq), inf_norm(v_ineq), inf_norm(v_comp), comp_prod)
+
+        stationarity = config.check_stationarity ? INF : zero(T)
+        if config.check_stationarity && feasible
+            stationarity = eval_augmented_gradient_inf(sub, z, p)
         end
-        stationary = !check_stationarity || (feasible && stationarity < stationarity_tol)
+        stationary = !config.check_stationarity ||
+                     (feasible && stationarity < config.stationarity_tol)
+
         if config.print_level >= 1
-            @info "AuLa outer iteration" iteration=outer objective=NLPModels.obj(sub.model, x) max_constraint_violation=max_v complementarity=maximum(comp_prod_blocks; init=0.0) complementarity_split=comp_res_u stationarity=stationarity
+            print("Outer ", outer_iter, ": equality=", inf_norm(v_eq), " inequality=", inf_norm(v_ineq))
+            ncomp > 0 && print(" comp=", comp_prod, " comp_res=", inf_norm(v_comp))
+            config.check_stationarity && print(" stationarity=",stationarity)
+            println()
         end
+
         if feasible && stationary
             converged = true
             break
         end
 
-        # If repeated outer iterations make no primal movement while severe
-        # infeasibility or nonstationarity remains, perturb along -grad(f),
-        # reset dual state, and restart from the configured penalty seeds.
-        if restart_count < sub.max_stagnation_restarts
-            step_inf = _inf(x - previous_point)
-            step_floor = 1e-10 * (1 + _inf(x))
+        if stagnation_restarts < config.max_stagnation_restarts
+            step_inf = inf_norm(z - z_outer_start)
+            step_floor = 1e-10 * (1.0 + inf_norm(z))
             stagnant_outer = step_inf <= step_floor ? stagnant_outer + 1 : 0
-            severe_infeas = any(unscaled_violations .> 10 .* [b.tol for b in sub.dual_blocks]) ||
-                any(comp_term_blocks .> 10 .* [c.tol for c in sub.comp_blocks]) ||
-                any(comp_split_blocks .> 10 .* [c.tol for c in sub.comp_blocks])
-            severe_nonstat = check_stationarity && feasible && stationarity > 10 * stationarity_tol
-            if stagnant_outer >= 3 && (severe_infeas || severe_nonstat)
-                d = -NLPModels.grad(sub.model, x)
-                dinf = _inf(d)
-                if !all(isfinite, d) || dinf <= 1e-12
-                    d = [isodd(k + restart_count) ? 1.0 : -1.0 for k in eachindex(x)]
+            severely_infeasible = any(>(10config.outer_tol_h), v_eq) ||
+                                  any(>(10config.outer_tol_g), v_ineq) ||
+                                  any(>(10config.outer_tol_comp), v_comp) ||
+                                  any(>(10config.outer_tol_comp), comp_products)
+            severely_nonstationary = config.check_stationarity && feasible &&
+                                     stationarity > 10config.stationarity_tol
+            if stagnant_outer >= 3 && (severely_infeasible || severely_nonstationary)
+                direction = -eval_task_gradient(sub, z, p)
+                d_inf = inf_norm(direction)
+                if !all(isfinite,direction) || d_inf <= 1e-12
+                    direction = T[iseven(i-1+stagnation_restarts) ? 1 : -1 for i in eachindex(z)]
                 else
-                    d ./= dinf
+                    direction /= d_inf
                 end
-                x .+= 1e-2 .* max.(1, abs.(x)) .* d
-                _reset_penalties!(sub, config)
-                if !isempty(sub.comp_blocks)
-                    G, H = _current_comp(sub, x)
-                    foreach(c -> project_complementarity!(c, G, H), sub.comp_blocks)
+                z .+= 1e-2 .* max.(one(T), abs.(z)) .* direction
+                p = make_params(sub)
+                if ncomp > 0
+                    G, H = eval_gh(sub, z, p)
+                    project_comp!(G, H, p)
                 end
-                fill!(vprev, Inf); fill!(vcprev, Inf)
-                outer_viol_prev = 1e3
+                for old in v_prev
+                    fill!(old, INF)
+                end
+                outer_viol_prev = T(1e3)
                 stagnant_outer = 0
-                restart_count += 1
-                sync_params!(sub)
+                stagnation_restarts += 1
             end
         end
     end
 
-    elapsed = (time_ns() - start_time) / 1e9
-    # Return raw, unscaled feasibility measures and MPCC certificates. The
-    # support values pair positive complementarity legs with their split
-    # multipliers; unlike active-set classifications, these need no threshold.
-    G, H = _current_comp(sub, x)
-    comp_prod = _inf(G .* H)
-    negG = _inf(min.(G, 0)); negH = _inf(min.(H, 0))
-    supportG = 0.0; supportH = 0.0
-    for c in sub.comp_blocks
-        supportG = max(supportG, _inf(min.(max.(G, 0), abs.(c.kappaG))))
-        supportH = max(supportH, _inf(min.(max.(H, 0), abs.(c.kappaH))))
+    # Fill the public result fields.
+    res = AulaResult{T}(;
+        z=z,
+        converged=converged,
+        outer_iterations=outer_iters,
+        total_inner_iterations=total_inner,
+        total_gn_iterations=total_gn)
+    res.objective_value = eval_task_objective(sub, z, p)
+    config.check_stationarity && (res.stationarity_violation = eval_augmented_gradient_inf(sub, z, p))
+
+    G, H = eval_gh(sub, z, p)
+    eq, ineq = copy(f.h(z, p)), copy(f.g(z, p))
+    res.equality_violation = inf_norm(eq)
+    res.inequality_violation = inf_norm(max.(ineq, 0))
+    res.complementarity_violation = inf_norm(G .* H)
+    res.comp_neg_G = inf_norm(min.(G, 0))
+    res.comp_neg_H = inf_norm(min.(H, 0))
+    res.comp_support_G = inf_norm(min.(max.(G, 0), abs.(p.kappaG)))
+    res.comp_support_H = inf_norm(min.(max.(H, 0), abs.(p.kappaH)))
+
+    res.solve_time = (time_ns() - t_start) * 1e-9
+    res.eval_time = gn.eval_seconds
+    res.factor_time = gn.factor_seconds
+    if converged
+        res.status = :converged
+        res.status_message = "Converged"
+    elseif any_la_failure
+        res.status = :linear_algebra_failure
+        res.status_message = "Linear-algebra failure: X-update factorisation stuck"
+    else
+        res.status = :max_iterations
+        res.status_message = config.check_stationarity && isfinite(res.stationarity_violation) ?
+            "Max outer iterations reached (feasibility or stationarity)" : "Max outer iterations reached"
     end
-    raw_violations = T[]
-    for b in sub.dual_blocks
-        raw = _block_raw(sub, x, b)
-        push!(raw_violations, b.kind === :equality ? _inf(raw) : _inf(max.(raw, 0)))
+
+    if config.print_level >= 1
+        println(repeat("=",60),"\n",converged ? "CONVERGED" : "STOPPED ($(res.status))",
+                " in ",res.solve_time,"s, ",res.outer_iterations," outer / ",total_inner," inner\n",repeat("=",60))
     end
-    eqviol = maximum([raw_violations[i] for (i,b) in enumerate(sub.dual_blocks) if b.kind === :equality]; init=0.0)
-    ineqviol = maximum([raw_violations[i] for (i,b) in enumerate(sub.dual_blocks) if b.kind === :inequality]; init=0.0)
-    stat = check_stationarity ? _inf(evaluate_augmented(sub, x)[2]) : 0.0
-    cv = ConstraintViolation{T}[]
-    for (i,b) in enumerate(sub.dual_blocks)
-        push!(cv, ConstraintViolation(b.name, T(raw_violations[i]), T(raw_violations[i])))
+    return res
+end
+
+
+"""Per-constraint safeguarded penalty update.
+rho is raised only when a constraint is still above tolerance and did not
+decrease enough since the previous outer iteration.
+"""
+function safeguarded_penalty(rho, v_new, v_old, tol, eta, gamma, rho_max)
+    violating = v_new >= tol
+    insufficient_decrease = v_new > eta * v_old
+    return violating && insufficient_decrease ? min(rho * gamma,rho_max) : rho
+end
+
+
+inf_norm(v) = isempty(v) ? zero(eltype(v)) : norm(v, Inf)
+
+
+function project_comp!(G, H, p)
+    for i in eachindex(G,H,p.rho_comp)
+        range = i:i
+        project_complementarity!(view(G, range), view(H, range),
+            view(p.kappaG, range), view(p.kappaH, range), p.rho_comp[i],
+            view(p.sG, range), view(p.sH, range))
     end
-    for c in sub.comp_blocks
-        split = max(_inf(G - c.sG), _inf(H - c.sH))
-        push!(cv, ConstraintViolation(c.name, T(comp_prod), T(split)))
-    end
-    # Preserve whether any inner X update got stuck, even if later outer
-    # iterations recovered. Convergence always takes precedence in the status.
-    status = converged ? :converged : la_failure ? :linear_algebra_failure : :max_iterations
-    msg = converged ? "Converged" : la_failure ? "Linear-algebra failure in X update" :
-          check_stationarity ? "Max outer iterations reached (feasibility or stationarity)" :
-          "Max outer iterations reached"
-    return AulaResult(T.(x), T(NLPModels.obj(sub.model, x)), converged, status, msg,
-        nouter, total_inner, total_gn, T(eqviol), T(ineqviol), T(comp_prod), T(stat),
-        T(negG), T(negH), T(supportG), T(supportH), cv, elapsed,
-        solver.gn.eval_seconds, solver.gn.factor_seconds)
 end

@@ -64,8 +64,19 @@ mutable struct GaussNewtonSolver
     factor_seconds::Float64
 end
 
-function GaussNewtonSolver(ℓ, ∇ℓ, ∇²ℓ, residual, jacobian,
-                           config::GaussNewtonConfig=GaussNewtonConfig())
+GaussNewtonSolver() = GaussNewtonSolver((;), GaussNewtonConfig(), nothing, nothing,
+                                        0, false, 0.0, 0.0)
+
+"""
+    init(solver::GaussNewtonSolver, ℓ, ∇ℓ, ∇²ℓ, residual, jacobian,
+         config=GaussNewtonConfig())
+
+Bind or replace callbacks `(x, p) -> value` and configure the solver. Return
+`solver`. Reuse the factorisation cache when its matrix pattern is unchanged;
+changing the linear-algebra backend clears the cache. Call before `solve!`.
+"""
+function init(solver::GaussNewtonSolver, ℓ, ∇ℓ, ∇²ℓ, residual, jacobian,
+              config::GaussNewtonConfig=GaussNewtonConfig())
     config.max_iter > 0 && config.max_damping_tries > 0 ||
         throw(ArgumentError("iteration and damping retry limits must be positive"))
     for name in (:grad_tol, :step_tol, :lambda_init, :lambda_min, :lambda_max,
@@ -77,12 +88,21 @@ function GaussNewtonSolver(ℓ, ∇ℓ, ∇²ℓ, residual, jacobian,
         throw(ArgumentError("lambda_min must not exceed lambda_max"))
     config.saddle_refinement_steps >= 0 ||
         throw(ArgumentError("saddle_refinement_steps must be nonnegative"))
-    callbacks = (; ℓ, ∇ℓ, ∇²ℓ, residual, jacobian)
-    return GaussNewtonSolver(callbacks, config, nothing, nothing, 0, false, 0.0, 0.0)
+    if solver.config.use_saddle != config.use_saddle
+        solver.factor = nothing
+        solver.pattern = nothing
+    end
+    solver.functions = (; ℓ, ∇ℓ, ∇²ℓ, residual, jacobian)
+    solver.config = config
+    solver.last_iterations = 0
+    solver.last_x_update_failed = false
+    solver.eval_seconds = 0.0
+    solver.factor_seconds = 0.0
+    return solver
 end
 
 """
-    solve(solver::GaussNewtonSolver, params, x; grad_tol=-1)
+    solve!(solver::GaussNewtonSolver, params, x; grad_tol=-1)
 
 Minimise `ℓ(x; p) + ½‖r(x; p)‖²`, modifying `x` in place, and return
 the final objective. A positive `grad_tol` overrides the configured tolerance.
@@ -92,6 +112,7 @@ accepted. Evaluation and factorisation timers accumulate across calls.
 """
 function solve!(solver::GaussNewtonSolver, params, x::AbstractVector{T};
                 grad_tol::Real=-1) where {T<:AbstractFloat}
+    isempty(solver.functions) && throw(ArgumentError("call init before solve!"))
     c = solver.config
     gtol = grad_tol > 0 ? grad_tol : c.grad_tol
 
