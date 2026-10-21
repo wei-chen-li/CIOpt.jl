@@ -5,8 +5,8 @@ Base.@kwdef mutable struct AulaResult{T<:AbstractFloat}
     z::Vector{T}
 
     objective_value::T = zero(T)            # f(z)
-    equality_violation::T = zero(T)         # ‖h(z)‖_inf
-    inequality_violation::T = zero(T)       # ‖max(g(z), 0)‖_inf
+    equality_violation::T = zero(T)         # ‖eq(z)‖_inf
+    inequality_violation::T = zero(T)       # ‖max(ineq(z), 0)‖_inf
     complementarity_violation::T = zero(T)  # ‖G(z) ∘ H(z)‖_inf
     stationarity_violation::T = zero(T)     # ‖∇ Lᵨ(z)‖_inf
 
@@ -48,20 +48,24 @@ mutable struct AulaSolver
 end
 AulaSolver() = AulaSolver(GaussNewtonSolver())
 
-function solve!(solver::AulaSolver, sub::AulaSubproblem{M,T}, config::AulaConfig,
-                z_init::AbstractVector) where {M,T}
+function solve!(solver::AulaSolver, sub::AulaSubproblem, config::AulaConfig,
+                z_init::AbstractVector)
     t_start = time_ns()
-    length(z_init) == sub.nvar && all(isfinite,z_init) ||
+    length(z_init) == get_nvar(sub) && all(isfinite, z_init) ||
         throw(ArgumentError("AulaSolver: invalid initial decision vector"))
 
     # Bind the Gauss-Newton X-solver to this subproblem.
-    gn_cfg = GaussNewtonConfig(config)
-    f, p = sub.functions, make_params(sub)
-    residual = (x, p)->eval_residual(sub, x, p)
-    jacobian = (x, p)->eval_jacobian(sub, x, p)
-    init(solver.gn, f.ℓ, f.∇ℓ, f.∇²ℓ, residual, jacobian, gn_cfg)
+    init(solver.gn;
+         ℓ=(x, _)->eval_obj(sub, x),
+         ∇ℓ=(x, _)->eval_obj_grad(sub, x),
+         ∇²ℓ=(x, _)->eval_obj_hess(sub, x),
+         residual=(x, p)->eval_al_residual(sub, x, p),
+         jacobian=(x, p)->eval_al_residual_jacobian(sub, x, p),
+         config=GaussNewtonConfig(config))
     gn = solver.gn
 
+    p = make_params(sub)
+    T = eltype(p.rho_eq)
     z = Vector{T}(z_init)
     neq, nineq, ncomp = length(p.kappa_eq), length(p.kappa_ineq), length(p.kappaG)
 
@@ -80,9 +84,9 @@ function solve!(solver::AulaSolver, sub::AulaSubproblem{M,T}, config::AulaConfig
     balanced_rho(d2,f_abs) = clamp(2 * max(1, f_abs) / d2,
                                   config.auto_rho_clip_min, config.auto_rho_clip_max)
     if config.auto_rho_init
-        f0 = abs(eval_task_objective(sub, z, p))
-        eq, ineq = copy(f.h(z, p)), copy(f.g(z, p))
-        G, H = eval_gh(sub, z, p)
+        f0 = abs(eval_obj(sub, z))
+        eq, ineq = eval_eq(sub, z), eval_ineq(sub, z)
+        G, H = eval_GH(sub, z)
         d2_comp = min.(abs2.(min.(G,0)) + abs2.(H), abs2.(G) + abs2.(min.(H,0)))
         for (rho, d2 ,done) in ((p.rho_eq,   abs2.(eq),           rho_balanced.eq),
                                 (p.rho_ineq, abs2.(max.(ineq,0)), rho_balanced.ineq),
@@ -96,8 +100,8 @@ function solve!(solver::AulaSolver, sub::AulaSubproblem{M,T}, config::AulaConfig
 
     if config.print_level >= 1
         println(repeat("=",60),"\nBCD-AuLa (IMPACT) Solver\n",repeat("=",60))
-        println("Variables: ",sub.nvar,", equality: ",neq,", inequality: ",nineq,
-                ", complementarity pairs: ",ncomp)
+        println("Variables: ", get_nvar(sub), ", equality: ", neq,", inequality: ", nineq,
+                ", complementarity pairs: ", ncomp)
     end
 
     converged = false
@@ -126,7 +130,7 @@ function solve!(solver::AulaSolver, sub::AulaSubproblem{M,T}, config::AulaConfig
                     : config.inner_tol_final)
 
         # Inner BCD loop: alternate the GN X-update and the closed-form slack update.
-        phi_prev = eval_augmented_objective(sub, z, p)
+        phi_prev = eval_al_objective(sub, z, p)
         for inner in 0:(config.max_inner_iters-1)
             total_inner += 1
 
@@ -141,18 +145,18 @@ function solve!(solver::AulaSolver, sub::AulaSubproblem{M,T}, config::AulaConfig
             total_gn += gn.last_iterations
 
             if ncomp > 0
-                G, H = eval_gh(sub, z, p)
+                G, H = eval_GH(sub, z)
                 project_comp!(G, H, p)
             end
 
-            phi_S = eval_augmented_objective(sub, z, p)
+            phi_S = eval_al_objective(sub, z, p)
             config.print_level >= 2 && println("  Inner $inner: phi=$phi_S")
             abs(phi_prev - phi_S) < inner_tol && break
             phi_prev = phi_S
         end
 
         # Dual ascent and scaled violation measurement for equalities and inequalities.
-        eq, ineq = copy(f.h(z,p)), copy(f.g(z,p))
+        eq, ineq = eval_eq(sub,z), eval_ineq(sub,z)
         p.kappa_eq .= p.kappa_eq + p.rho_eq .* eq
         p.kappa_ineq .= max.(p.kappa_ineq + p.rho_ineq .* ineq, 0)
         v_eq = abs.(eq)
@@ -186,7 +190,7 @@ function solve!(solver::AulaSolver, sub::AulaSubproblem{M,T}, config::AulaConfig
         # growth that already happened. Costs one residual eval per still-unbalanced
         # block per outer iteration, and nothing once every block is balanced.
         if config.auto_rho_init && any(!all(done) for done in rho_balanced)
-            f_cur = abs(eval_task_objective(sub, z, p))
+            f_cur = abs(eval_obj(sub, z))
             d2_comp = abs2.(comp_res_G) + abs2.(comp_res_H)
             for (rho, d2, done) in ((p.rho_eq,   abs2.(eq),           rho_balanced.eq),
                                     (p.rho_ineq, abs2.(max.(ineq,0)), rho_balanced.ineq),
@@ -209,7 +213,7 @@ function solve!(solver::AulaSolver, sub::AulaSubproblem{M,T}, config::AulaConfig
 
         stationarity = config.check_stationarity ? INF : zero(T)
         if config.check_stationarity && feasible
-            stationarity = eval_augmented_gradient_inf(sub, z, p)
+            stationarity = eval_al_objective_grad_inf(sub, z, p)
         end
         stationary = !config.check_stationarity ||
                      (feasible && stationarity < config.stationarity_tol)
@@ -237,7 +241,7 @@ function solve!(solver::AulaSolver, sub::AulaSubproblem{M,T}, config::AulaConfig
             severely_nonstationary = config.check_stationarity && feasible &&
                                      stationarity > 10config.stationarity_tol
             if stagnant_outer >= 3 && (severely_infeasible || severely_nonstationary)
-                direction = -eval_task_gradient(sub, z, p)
+                direction = -eval_obj_grad(sub, z)
                 d_inf = inf_norm(direction)
                 if !all(isfinite,direction) || d_inf <= 1e-12
                     direction = T[iseven(i-1+stagnation_restarts) ? 1 : -1 for i in eachindex(z)]
@@ -247,7 +251,7 @@ function solve!(solver::AulaSolver, sub::AulaSubproblem{M,T}, config::AulaConfig
                 z .+= 1e-2 .* max.(one(T), abs.(z)) .* direction
                 p = make_params(sub)
                 if ncomp > 0
-                    G, H = eval_gh(sub, z, p)
+                    G, H = eval_GH(sub, z)
                     project_comp!(G, H, p)
                 end
                 for old in v_prev
@@ -267,11 +271,11 @@ function solve!(solver::AulaSolver, sub::AulaSubproblem{M,T}, config::AulaConfig
         outer_iterations=outer_iters,
         total_inner_iterations=total_inner,
         total_gn_iterations=total_gn)
-    res.objective_value = eval_task_objective(sub, z, p)
-    config.check_stationarity && (res.stationarity_violation = eval_augmented_gradient_inf(sub, z, p))
+    res.objective_value = eval_obj(sub, z; original=true)
+    config.check_stationarity && (res.stationarity_violation = eval_al_objective_grad_inf(sub, z, p))
 
-    G, H = eval_gh(sub, z, p)
-    eq, ineq = copy(f.h(z, p)), copy(f.g(z, p))
+    G, H = eval_GH(sub, z)
+    eq, ineq = eval_eq(sub, z), eval_ineq(sub, z)
     res.equality_violation = inf_norm(eq)
     res.inequality_violation = inf_norm(max.(ineq, 0))
     res.complementarity_violation = inf_norm(G .* H)
@@ -314,9 +318,7 @@ function safeguarded_penalty(rho, v_new, v_old, tol, eta, gamma, rho_max)
 end
 
 
-inf_norm(v) = isempty(v) ? zero(eltype(v)) : norm(v, Inf)
-
-
+"""Per-complementarity slack projection."""
 function project_comp!(G, H, p)
     for i in eachindex(G,H,p.rho_comp)
         range = i:i
@@ -325,3 +327,6 @@ function project_comp!(G, H, p)
             view(p.sG, range), view(p.sH, range))
     end
 end
+
+
+inf_norm(v) = isempty(v) ? zero(eltype(v)) : norm(v, Inf)

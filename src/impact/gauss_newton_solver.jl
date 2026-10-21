@@ -68,14 +68,14 @@ GaussNewtonSolver() = GaussNewtonSolver((;), GaussNewtonConfig(), nothing, nothi
                                         0, false, 0.0, 0.0)
 
 """
-    init(solver::GaussNewtonSolver, ℓ, ∇ℓ, ∇²ℓ, residual, jacobian,
+    init(solver::GaussNewtonSolver; ℓ, ∇ℓ, ∇²ℓ, residual, jacobian,
          config=GaussNewtonConfig())
 
 Bind or replace callbacks `(x, p) -> value` and configure the solver. Return
 `solver`. Reuse the factorisation cache when its matrix pattern is unchanged;
 changing the linear-algebra backend clears the cache. Call before `solve!`.
 """
-function init(solver::GaussNewtonSolver, ℓ, ∇ℓ, ∇²ℓ, residual, jacobian,
+function init(solver::GaussNewtonSolver; ℓ, ∇ℓ, ∇²ℓ, residual, jacobian,
               config::GaussNewtonConfig=GaussNewtonConfig())
     config.max_iter > 0 && config.max_damping_tries > 0 ||
         throw(ArgumentError("iteration and damping retry limits must be positive"))

@@ -62,6 +62,13 @@ function MPCCModels.comp_res_right!(::PublicAPIMPCC{T}, x::AbstractVector{T},
     return out
 end
 
+# The default allocating method accesses a private MPCC work buffer.
+function MPCCModels.comp_res_right(model::PublicAPIMPCC{T},
+                                   x::AbstractVector{T}) where {T}
+    out = Vector{T}(undef, MPCCModels.get_ncc(model))
+    return MPCCModels.comp_res_right!(model, x, out)
+end
+
 function MPCCModels.jac_comp_left(::PublicAPIMPCC{T}, x::AbstractVector{T}) where {T}
     return sparse(T[1 0 0 0; 0 x[3] x[2] 0])
 end
@@ -84,13 +91,13 @@ function check_bound_rows(values, jacobian, expected_values, expected_jacobian)
     end
 end
 
-function finite_difference_jacobian(callback, x, params)
+function finite_difference_jacobian(callback, x)
     step = 1e-6
     columns = map(eachindex(x)) do j
         plus, minus = copy(x), copy(x)
         plus[j] += step
         minus[j] -= step
-        (callback(plus, params) - callback(minus, params)) / (2step)
+        (callback(plus) - callback(minus)) / (2step)
     end
     return hcat(columns...)
 end
@@ -101,13 +108,9 @@ end
                               print_level=0)
     sub = CIOpt.AulaSubproblem(model, config)
     x = copy(NLPModels.get_x0(model))
-    f, p = sub.functions, CIOpt.make_params(sub)
+    p = CIOpt.make_params(sub)
 
-    @test sub.model === model
-    @test sub.nvar == 4
-    @test !hasproperty(sub, :params)
-    @test sub.params_info isa NamedTuple
-    @test (sub.params_info.neq, sub.params_info.nineq, sub.params_info.ncomp) == (2, 6, 2)
+    @test CIOpt.get_nvar(sub) == 4
     @test p isa NamedTuple
     @test !hasproperty(p,:data)
     @test p.rho_eq == fill(2.0, 2)
@@ -118,34 +121,31 @@ end
         @test getproperty(p, name) == zeros(dimension)
     end
 
-    # Maximization changes the inner objective's sign while objective reports
-    # the model's original objective value.
-    @test f.objective(x, p) == NLPModels.obj(model, x)
-    @test f.ℓ(x, p) == -NLPModels.obj(model, x)
-    @test f.∇ℓ(x, p) == -NLPModels.grad(model, x)
-    @test f.∇²ℓ(x, p) == -NLPModels.hess(model, x)
+    # Maximization negates the objective and its derivatives for minimization.
+    @test CIOpt.eval_obj(sub, x) == -NLPModels.obj(model, x)
+    @test CIOpt.eval_obj_grad(sub, x) == -NLPModels.grad(model, x)
+    @test CIOpt.eval_obj_hess(sub, x) == -NLPModels.hess(model, x)
 
-    check_bound_rows(f.h(x, p), f.jac_h(x, p),
+    J = CIOpt.eval_al_residual_jacobian(sub, x, p)
+    check_bound_rows(CIOpt.eval_eq(sub, x), J[1:2, :] / sqrt(2.0),
                      [x[4] - 4, x[1] + x[3] - 1],
                      [0.0 0 0 1; 1 0 1 0])
     # The lower bounds of complementarity variables x1/x2 are represented by
     # G/H. Their finite upper bounds, other bounds, and fixed x4 are retained.
-    check_bound_rows(f.g(x, p), f.jac_g(x, p),
-                     [x[1] - 8, -1 - x[3], x[3] - 5,
-                      2 - x[2] * x[4], x[2] * x[4] - 6, x[3] - 2x[4] - 3],
-                     [1.0 0 0 0; 0 0 -1 0; 0 0 1 0;
-                      0 -x[4] 0 -x[2]; 0 x[4] 0 x[2]; 0 0 1 -2])
-    @test f.G(x, p) == [x[1] - 2, x[2] * x[3] - 5]
-    @test f.H(x, p) == [x[2] - 3, x[4] + 2x[1] - 7]
-    @test f.jac_G(x, p) == [1.0 0 0 0; 0 x[3] x[2] 0]
-    @test f.jac_H(x, p) == [0.0 1 0 0; 2 0 0 1]
-
-    # Constraint callbacks stay unscaled when the shared penalty state changes.
-    p.rho_eq .= 7
-    p.rho_ineq .= 11
-    p.rho_comp .= [13, 17]
-    @test f.G(x, p) == [x[1] - 2, x[2] * x[3] - 5]
-    @test f.jac_G(x, p) == [1.0 0 0 0; 0 x[3] x[2] 0]
+    inequalities = [x[1] - 8, -1 - x[3], x[3] - 5,
+                    2 - x[2] * x[4], x[2] * x[4] - 6, x[3] - 2x[4] - 3]
+    inequality_jacobian = [1.0 0 0 0; 0 0 -1 0; 0 0 1 0;
+                           0 -x[4] 0 -x[2]; 0 x[4] 0 x[2]; 0 0 1 -2]
+    masked_jacobian = Diagonal(inequalities .> 0) * inequality_jacobian
+    check_bound_rows(CIOpt.eval_ineq(sub, x), J[3:8, :] / sqrt(3.0),
+                     inequalities, masked_jacobian)
+    G = [x[1] - 2, x[2] * x[3] - 5]
+    H = [x[2] - 3, x[4] + 2x[1] - 7]
+    @test CIOpt.eval_GH(sub, x) == (G, H)
+    @test J[9:10, :] / sqrt(5.0) ≈ [1.0 0 0 0; 0 x[3] x[2] 0]
+    @test J[11:12, :] / sqrt(5.0) ≈ [0.0 1 0 0; 2 0 0 1]
+    numerical = finite_difference_jacobian(y -> CIOpt.eval_al_residual(sub, y, p), x)
+    @test Matrix(J) ≈ numerical atol=2e-7 rtol=2e-7
 end
 
 @testset "AulaSubproblem fresh parameter state" begin
@@ -162,27 +162,40 @@ end
               for i in eachindex(names) for j in (i+1):length(names))
 
     x = NLPModels.get_x0(model)
-    initial_residual = CIOpt.eval_residual(sub, x, p2)
-    initial_jacobian = CIOpt.eval_jacobian(sub, x, p2)
+    initial_residual = CIOpt.eval_al_residual(sub, x, p2)
+    initial_jacobian = CIOpt.eval_al_residual_jacobian(sub, x, p2)
     p1.kappa_eq .= [2, -2]
     p1.sG[1] = 0.25
-    residual = CIOpt.eval_residual(sub, x, p1)
+    residual = CIOpt.eval_al_residual(sub, x, p1)
     @test residual[1:2] ≈ initial_residual[1:2] + [1, -1]
     @test residual[9:10] ≈ initial_residual[9:10] + [-1, 0]
-    @test CIOpt.eval_residual(sub, x, p2) == initial_residual
+    @test CIOpt.eval_al_residual(sub, x, p2) == initial_residual
     @test p2.kappa_eq == zeros(2)
     @test p2.sG == zeros(2)
 
-    expected_value = sub.functions.ℓ(x, p1) + dot(residual, residual) / 2
-    @test CIOpt.eval_augmented_objective(sub, x, p1) ≈ expected_value
-    @test CIOpt.eval_task_objective(sub, x, p1) == NLPModels.obj(model, x)
-    @test CIOpt.eval_task_gradient(sub, x, p1) == -NLPModels.grad(model, x)
-    gradient = sub.functions.∇ℓ(x, p1) + initial_jacobian' * residual
-    @test CIOpt.eval_augmented_gradient_inf(sub, x, p1) ≈ norm(gradient, Inf)
+    expected_value = CIOpt.eval_obj(sub, x) + dot(residual, residual) / 2
+    @test CIOpt.eval_al_objective(sub, x, p1) ≈ expected_value
+    gradient = CIOpt.eval_obj_grad(sub, x) + initial_jacobian' * residual
+    @test CIOpt.eval_al_objective_grad_inf(sub, x, p1) ≈ norm(gradient, Inf)
 
     p1.rho_eq .= 16
-    @test CIOpt.eval_jacobian(sub, x, p1)[1:2, :] ≈ 2initial_jacobian[1:2, :]
-    @test CIOpt.eval_jacobian(sub, x, p2) == initial_jacobian
+    @test CIOpt.eval_al_residual_jacobian(sub, x, p1)[1:2, :] ≈ 2initial_jacobian[1:2, :]
+    @test CIOpt.eval_al_residual_jacobian(sub, x, p2) == initial_jacobian
+
+    # A positive multiplier can activate a satisfied inequality. Its shifted
+    # residual, rather than the sign of the raw constraint, selects the row.
+    inequalities = CIOpt.eval_ineq(sub, x)
+    inactive = findfirst(value -> value < 0, inequalities)
+    p1.kappa_ineq[inactive] = p1.rho_ineq[inactive] * (1 - inequalities[inactive])
+    row = length(p1.kappa_eq) + inactive
+    @test initial_residual[row] == 0
+    @test CIOpt.eval_al_residual(sub, x, p1)[row] ≈ 3
+    @test all(iszero, initial_jacobian[row, :])
+    active_jacobian = CIOpt.eval_al_residual_jacobian(sub, x, p1)
+    @test norm(active_jacobian[row, :]) > 0
+    numerical = finite_difference_jacobian(y -> CIOpt.eval_al_residual(sub, y, p1), x)
+    @test Matrix(active_jacobian) ≈ numerical atol=2e-7 rtol=2e-7
+    @test CIOpt.eval_al_residual(sub, x, p2) == initial_residual
 
     fresh = CIOpt.make_params(sub)
     @test fresh.rho_eq == fill(4.0, 2)
@@ -227,31 +240,33 @@ end
     # Source rows 2 and 5 become ordinary MPCC rows 1 and 2.
     model = MPCCModels.MPCCModelConCon(nlp, [1, 4], [3, 6])
     sub = CIOpt.AulaSubproblem(model)
-    f, p = sub.functions, CIOpt.make_params(sub)
+    p = CIOpt.make_params(sub)
     c = constraints(x)
 
     @test NLPModels.get_ncon(model) == 2
     @test NLPModels.cons(model, x) ≈ c[[2, 5]]
-    @test f.ℓ(x, p) ≈ objective(x)
-    @test f.∇ℓ(x, p) ≈ 2x
-    @test f.∇²ℓ(x, p) ≈ 2Matrix{Float64}(I, 4, 4)
-    check_bound_rows(f.h(x, p), f.jac_h(x, p),
+    @test CIOpt.eval_obj(sub, x) ≈ objective(x)
+    @test CIOpt.eval_obj_grad(sub, x) ≈ 2x
+    @test CIOpt.eval_obj_hess(sub, x) ≈ 2Matrix{Float64}(I, 4, 4)
+    # Activate all inequality residual rows to inspect both signs of every
+    # bound Jacobian, including bounds that are satisfied at this sample point.
+    p.kappa_ineq .= p.rho_ineq .* (1 .+ abs.(CIOpt.eval_ineq(sub, x)))
+    J = CIOpt.eval_al_residual_jacobian(sub, x, p)
+    check_bound_rows(CIOpt.eval_eq(sub, x), J[1:2, :],
                      [x[4] - 0.5, c[2] - 1],
                      [0.0 0 0 1; 1 2 -1 0])
-    check_bound_rows(f.g(x, p), f.jac_g(x, p),
+    check_bound_rows(CIOpt.eval_ineq(sub, x), J[3:8, :],
                      [x[1] - 3, -2 - x[2], 1 - x[3], x[3] - 4,
                       -1 - c[5], c[5] - 5],
                      [1.0 0 0 0; 0 -1 0 0; 0 0 -1 0; 0 0 1 0;
                       -x[4] -2x[2] 0 -x[1]; x[4] 2x[2] 0 x[1]])
-    @test f.G(x, p) ≈ c[[1, 4]] - [2, 1]
-    @test f.H(x, p) ≈ c[[3, 6]] - [3, 4]
-    @test f.jac_G(x, p) ≈ [2x[1] 1 0 0; 0 0 2x[3] 1]
-    @test f.jac_H(x, p) ≈ [0.0 x[3] x[2] 0; 1 0 x[4] x[3]]
-
-    for (callback, jacobian) in ((f.h, f.jac_h), (f.g, f.jac_g),
-                                  (f.G, f.jac_G), (f.H, f.jac_H))
-        @test Matrix(jacobian(x, p)) ≈ finite_difference_jacobian(callback, x, p) atol=2e-7 rtol=2e-7
-    end
+    G, H = CIOpt.eval_GH(sub, x)
+    @test G ≈ c[[1, 4]] - [2, 1]
+    @test H ≈ c[[3, 6]] - [3, 4]
+    @test J[9:10, :] ≈ [2x[1] 1 0 0; 0 0 2x[3] 1]
+    @test J[11:12, :] ≈ [0.0 x[3] x[2] 0; 1 0 x[4] x[3]]
+    numerical = finite_difference_jacobian(y -> CIOpt.eval_al_residual(sub, y, p), x)
+    @test Matrix(J) ≈ numerical atol=2e-7 rtol=2e-7
 end
 
 end # module AulaSubproblemTests

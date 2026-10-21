@@ -37,6 +37,6 @@ Returns the `AulaResult` from this solve.
 """
 function solve!(solver::ImpactSolver)
     s = solver
-    x_init = NLPModels.get_x0(s.aula_subproblem.model)
+    x_init = NLPModels.get_x0(s.aula_subproblem._mpcc)
     return solve!(s.aula_solver, s.aula_subproblem, s.aula_config, x_init)
 end
