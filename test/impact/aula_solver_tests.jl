@@ -1,9 +1,12 @@
 using CIOpt
 using ADNLPModels
 using MPCCModels
+using NLPModels
 using LinearAlgebra
 using SparseArrays
 using Test
+
+include("../problems/problems.jl")
 
 # Generic MPCC models: min ||z-target||² with variable complementarity pairs.
 function make_mpcc(target, x0)
@@ -53,7 +56,7 @@ end
     comp1 = abs(result.z[3] * result.z[4])
 
     @test result.converged
-        @test result.status == :converged
+    @test result.status == :converged
     @test comp0 < 1e-5
     @test comp1 < 1e-5
     @test result.objective_value ≈ 0.1025 atol=1e-2
@@ -79,4 +82,20 @@ end
         end
         gn = solver.gn
     end
+end
+
+@testset "Contact-implicit push circle" begin
+    problem = Problems.push_circle_model()
+    solver = ImpactSolver(problem.mpcc;
+        rho_eq_init=100.0, rho_ineq_init=100.0, rho_comp_init=1.0,
+        print_level=0)
+    result = CIOpt.solve!(solver)
+
+    @test result.converged
+    @test result.status == :converged
+    @test result.objective_value ≈ NLPModels.obj(problem.mpcc, result.z)
+    @test result.equality_violation < 1e-5
+    @test result.inequality_violation < 1e-5
+    @test result.complementarity_violation < 1e-5
+    Problems.test_push_circle_solution(problem, result.z)
 end
