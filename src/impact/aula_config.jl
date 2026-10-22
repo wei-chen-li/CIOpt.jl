@@ -64,6 +64,7 @@ Base.@kwdef struct AulaConfig
 
     # Inner loop (BCD sweeps).
     max_inner_iters::Int = 50
+    max_total_inner_iters::Int = typemax(Int)
     inner_tol_init::Float64 = 1e-2   # Stagnation tolerance, early outer iters
     inner_tol_final::Float64 = 1e-3  # Stagnation tolerance, later outer iters
     # Outer iteration at which the stagnation tolerance steps from inner_tol_init to
@@ -129,7 +130,7 @@ function validate(config::AulaConfig)
     isfinite(config.penalty_decrease_ratio) && 0 <= config.penalty_decrease_ratio <= 1 ||
         throw(ArgumentError("penalty_decrease_ratio must be finite and in [0, 1]"))
 
-    for name in (:max_outer_iters, :max_inner_iters, :newton_max_iter,
+    for name in (:max_outer_iters, :max_inner_iters, :max_total_inner_iters, :newton_max_iter,
                  :newton_max_damping_tries)
         getfield(config, name) > 0 || throw(ArgumentError("$name must be positive"))
     end

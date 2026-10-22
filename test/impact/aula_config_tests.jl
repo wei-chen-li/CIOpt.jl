@@ -19,7 +19,7 @@ include("../../src/impact/aula_config.jl")
             @test validate(AulaConfig(; name => !value)) isa AulaConfig
         end
     end
-    for name in (:max_outer_iters, :max_inner_iters, :newton_max_iter,
+    for name in (:max_outer_iters, :max_inner_iters, :max_total_inner_iters, :newton_max_iter,
                  :newton_max_damping_tries)
         @test_throws ArgumentError validate(AulaConfig(; name => 0))
     end

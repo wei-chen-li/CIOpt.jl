@@ -230,6 +230,8 @@ function solve!(solver::AulaSolver, sub::AulaSubproblem, config::AulaConfig,
             break
         end
 
+        total_inner >= config.max_total_inner_iters && break
+
         if stagnation_restarts < config.max_stagnation_restarts
             step_inf = inf_norm(z - z_outer_start)
             step_floor = 1e-10 * (1.0 + inf_norm(z))
@@ -296,7 +298,7 @@ function solve!(solver::AulaSolver, sub::AulaSubproblem, config::AulaConfig,
     else
         res.status = :max_iterations
         res.status_message = config.check_stationarity && isfinite(res.stationarity_violation) ?
-            "Max outer iterations reached (feasibility or stationarity)" : "Max outer iterations reached"
+            "Max iterations reached (feasibility or stationarity)" : "Max iterations reached"
     end
 
     if config.print_level >= 1
